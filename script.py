@@ -1,6 +1,10 @@
 import pandas as pd
+import subprocess
+import os
+import json
+import regex
 
-file_path = 'profile_results.csv'
+file_path = 'kernelpractise/profile.csv'
 
 # 1. Dynamically find where the CSV headers start
 header_row = 0

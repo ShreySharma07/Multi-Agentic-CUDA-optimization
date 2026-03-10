@@ -74,13 +74,13 @@ void UnifiedMemory(int numNeurons, int inputSize){
     cudaMallocManaged(&gpu_output, numNeurons * sizeof(float));
     cpu_output = (float*)malloc(numNeurons * sizeof(float));
 
-    // 1. Initialize ALL weights (numNeurons * inputSize)
+    // Initialize ALL weights (numNeurons * inputSize)
     initRandom(weights, -0.5f, 0.5f, numNeurons * inputSize); 
 
-    // 2. Initialize ALL biases (numNeurons)
+    //Initialize ALL biases (numNeurons)
     initRandom(bias, 0.0f, 0.01f, numNeurons);
 
-    // 3. Initialize ALL inputs (inputSize)
+    //Initialize ALL inputs (inputSize)
     initRandom(inputs, 0.0f, 1.0f, inputSize);
 
     cudaEvent_t start, stop;

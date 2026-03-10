@@ -1,0 +1,6 @@
+==PROF== Connected to process 7265 (/home/lab/project_26/Multi_Agent_CUDA_optimization/kernelpractise/sigmoid_kernel)
+==PROF== Disconnected from process 7265
+"ID","Process ID","Process Name","Host Name","Kernel Name","Context","Stream","Block Size","Grid Size","Device","CC","Section Name","Metric Name","Metric Unit","Metric Value"
+"0","7265","sigmoid_kernel","127.0.0.1","SigmoidActivation(float *, float *, float *, int, int, float *)","1","7","(256, 1, 1)","(40, 1, 1)","0","8.6","Command line profiler metrics","gpu__time_duration.sum","ns","376,704"
+"0","7265","sigmoid_kernel","127.0.0.1","SigmoidActivation(float *, float *, float *, int, int, float *)","1","7","(256, 1, 1)","(40, 1, 1)","0","8.6","Command line profiler metrics","l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum","byte","337,976,384"
+"0","7265","sigmoid_kernel","127.0.0.1","SigmoidActivation(float *, float *, float *, int, int, float *)","1","7","(256, 1, 1)","(40, 1, 1)","0","8.6","Command line profiler metrics","smsp__sass_thread_inst_executed_op_fadd_pred_on.sum","inst","30,000"
