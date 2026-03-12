@@ -71,38 +71,34 @@ def readFile(file_name, directory):
 
 AGENT_MODEL = 'gemini-2.5-flash'
 
-PROMPT = prompt = PROMPT = f"""
+PROMPT = f"""
 You are a CUDA optimization expert.
 
-You analyze CUDA kernels and profiler outputs to find performance bottlenecks.
-GPU specifications: RTX A4000 16GB (Ampere architecture).
+GPU: RTX A4000 16GB (Ampere architecture)
 
-You have access to the following tools:
-
-1. getFiles(directory_path, extension)
-   - Use this to list CUDA files available in the directory.
-
-2. readFile(file_name, directory)
-   - Use this to read the contents of a CUDA file.
-
-Workflow:
-1. First list CUDA files using getFiles.
-2. Ask the user which file they want to analyze.
-3. Use readFile to read the selected file.
-4. Analyze the kernel and profiler output.
-5. Identify bottlenecks.
-6. Provide an optimized CUDA kernel.
-
-Be concise and focus on performance improvements.
-DIRECTORY_PATH = "/your/cuda/project"
-
-CUDA files are located in this directory:
-
+CUDA files are located in:
 {DIRECTORY_PATH}
 
-Use this directory when calling tools.
-After providing the optimized kernel, end the conversation.
+Workflow:
 
+1. Use getFiles to list CUDA files.
+2. Ask the user which file to analyze.
+3. Use readFile to read the selected CUDA file.
+4. Identify the biggest performance bottlenecks.
+5. Rewrite the CUDA kernel with optimizations.
+
+IMPORTANT RULES:
+
+- Always output the FULL optimized CUDA kernel.
+- The optimized kernel must be complete and compilable.
+- Include the entire kernel code, not just a snippet.
+- Wrap the final optimized kernel inside a ```cpp code block.
+- Do not stop after explaining optimizations.
+
+Final output format:
+
+1. Short explanation of bottlenecks
+2. Fully optimized CUDA kernel
 """
 
 agent = Agent(
@@ -148,12 +144,13 @@ async def chat(query: str, runner, user_id, session_id):
     async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
         # print(f"  [Event] Author: {event.author}, Type: {type(event).__name__}, Final: {event.is_final_response()}, Content: {event.content}")
 
-        if event.is_final_response():
-            if event.content and event.content.parts:
-                final_response_text = event.content.parts[0].text
-            elif event.actions and event.actions.escalate: 
-                final_response_text = f"Agent escalated: {event.error_message or 'No specific message.'}"
-                break
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if hasattr(part, "text") and part.text:
+                    print(part.text, end="", flush=True)
+
+    if event.is_final_response():
+        print()
 
     print(f"<<< Agent Response: {final_response_text}")
 
