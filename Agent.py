@@ -10,7 +10,7 @@ import ast
 import time
 import os
 import subprocess
-import pathlib
+from pathlib import Path
 import google
 import asyncio
 from google.adk.agents import Agent
@@ -25,45 +25,92 @@ warnings.filterwarnings("ignore")
 import logging
 logging.basicConfig(level=logging.ERROR)
 
-PROFILE_PATH = "kernelpractise/sigmoid_profile.csv"
-CUDA_PATH = "kernelpractise/sigmoid_kernel.cu"
+DIRECTORY_PATH = Path("kernelpractise")
+# CUDA_PATH = "kernelpractise/sigmoid_kernel.cu"
 
-try:
-    if os.path.exists(CUDA_PATH):
-        with open(CUDA_PATH, 'r') as f:
-            cuda_code = f.read()
-except Exception as e:
-    print(e)
+# try:
+#     if os.path.exists(CUDA_PATH):
+#         with open(CUDA_PATH, 'r') as f:
+#             cuda_code = f.read()
+# except Exception as e:
+#     print(e)
 
-try:
-    if os.path.exists(PROFILE_PATH):
-        with open(PROFILE_PATH, 'r') as f:
-            profile = f.read()
-except Exception as e:
-    print(e)
+# try:
+#     if os.path.exists(PROFILE_PATH):
+#         with open(PROFILE_PATH, 'r') as f:
+#             profile = f.read()
+# except Exception as e:
+#     print(e)
 
 # os.environ['GOOGLE_API_KEY'] = 'GOOGLE_API'
 
+def getFiles(directory_path, extension):
+    try:
+        directory = Path(directory_path)
+        if not directory.exists():
+            return {"error": "Directory does not exist"}
+        
+        files = [f.name for f in directory.glob(f"*{extension}")]
+
+        return {'files':files}
+    except Exception as e:
+        print(e)
+
+def readFile(file_name, directory):
+    file_path = Path(directory) / file_name
+
+    if not file_path.exists():
+        print(f"file path {file_path} does not exists")
+    with file_path.open('r') as f:
+        content = f.read()
+    
+    return {"contents":content}
+
+
+
+
 AGENT_MODEL = 'gemini-2.5-flash'
 
-PROMPT = prompt = f"""
-You are a CUDA optimization expert. I will give you a kernel and profiler output.
-Tell me the single biggest bottleneck and why. GPU specifications are RTX A4000 16gb ampere architechture.
+PROMPT = prompt = PROMPT = f"""
+You are a CUDA optimization expert.
 
-CUDA KERNEL:
-{cuda_code}
+You analyze CUDA kernels and profiler outputs to find performance bottlenecks.
+GPU specifications: RTX A4000 16GB (Ampere architecture).
 
-PROFILER OUTPUT:
-{profile}
+You have access to the following tools:
 
-What is the ONE thing I should focus on?
+1. getFiles(directory_path, extension)
+   - Use this to list CUDA files available in the directory.
+
+2. readFile(file_name, directory)
+   - Use this to read the contents of a CUDA file.
+
+Workflow:
+1. First list CUDA files using getFiles.
+2. Ask the user which file they want to analyze.
+3. Use readFile to read the selected file.
+4. Analyze the kernel and profiler output.
+5. Identify bottlenecks.
+6. Provide an optimized CUDA kernel.
+
+Be concise and focus on performance improvements.
+DIRECTORY_PATH = "/your/cuda/project"
+
+CUDA files are located in this directory:
+
+{DIRECTORY_PATH}
+
+Use this directory when calling tools.
+After providing the optimized kernel, end the conversation.
+
 """
 
 agent = Agent(
     name = 'cuda_agent',
     model = AGENT_MODEL,
     description="inspect cuda kernel",
-    instruction=PROMPT
+    instruction=PROMPT,
+    tools=[getFiles, readFile]
 )
 
 session_service = InMemorySessionService()
@@ -112,6 +159,11 @@ async def chat(query: str, runner, user_id, session_id):
 
 if __name__ == "__main__":
     try:
-        asyncio.run(chat("What is the biggest bottleneck in my kernel?", runner, USER_ID, SESSION_ID))
+        while True:
+            query = input("\nuser query: ")
+
+            if query in ['stop', 'exit']:
+                break
+            asyncio.run(chat(query, runner, USER_ID, SESSION_ID))
     except Exception as e:
         print(f"An error occurred: {e}")
