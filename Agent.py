@@ -1,7 +1,3 @@
-# import dotenv
-
-# dotenv.load_dotenv()
-
 from pydantic import BaseModel, field_validator
 import pandas as pd
 import torch
@@ -17,6 +13,11 @@ from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.genai import types
 from google.adk.sessions import InMemorySessionService
+from tools.getfiles import getFiles
+from tools.readfiles import readFile
+from tools.compile_cuda import compile_cuda
+from tools.ncu_profile import run_ncu_profile
+from tools.parse_profile import parse_ncu_profile
 
 
 import warnings
@@ -43,29 +44,6 @@ DIRECTORY_PATH = Path("kernelpractise")
 #     print(e)
 
 # os.environ['GOOGLE_API_KEY'] = 'GOOGLE_API'
-
-def getFiles(directory_path, extension):
-    try:
-        directory = Path(directory_path)
-        if not directory.exists():
-            return {"error": "Directory does not exist"}
-        
-        files = [f.name for f in directory.glob(f"*{extension}")]
-
-        return {'files':files}
-    except Exception as e:
-        print(e)
-
-def readFile(file_name, directory):
-    file_path = Path(directory) / file_name
-
-    if not file_path.exists():
-        print(f"file path {file_path} does not exists")
-    with file_path.open('r') as f:
-        content = f.read()
-    
-    return {"contents":content}
-
 
 
 
