@@ -47,7 +47,7 @@ DIRECTORY_PATH = Path("kernelpractise")
 
 
 
-AGENT_MODEL = 'gemini-2.5-flash'
+AGENT_MODEL = 'gemini-3-flash'
 
 PROMPT = f"""
 You are a CUDA optimization expert.
