@@ -13,11 +13,6 @@ from google.adk.agents import Agent
 from google.adk.runners import Runner
 from google.genai import types
 from google.adk.sessions import InMemorySessionService
-from tools.getfiles import getFiles
-from tools.readfiles import readFile
-from tools.compile_cuda import compile_cuda
-from tools.ncu_profile import run_ncu_profile
-from tools.parse_profile import parse_ncu_profile
 from google.adk.errors import already_exists_error
 
 
@@ -85,7 +80,7 @@ agent = Agent(
     model = AGENT_MODEL,
     description="inspect cuda kernel",
     instruction=PROMPT,
-    tools=[getFiles, readFile, compile_cuda, run_ncu_profile, parse_ncu_profile]
+    tools=[]
 )
 
 session_service = InMemorySessionService()
@@ -156,18 +151,23 @@ async def chat(query: str, runner, user_id, session_id):
     content = types.Content(role='user', parts=[types.Part.from_text(text=query)])
     
     max_retries = 3
-    retry_delay = 10  # Seconds to wait after a 429
+    retry_delay = 10  
     
     for attempt in range(max_retries):
         try:
+            full_response = "" # 1. Create a variable to hold the complete response
+            
             async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
                 if event.content and event.content.parts:
                     for part in event.content.parts:
                         if hasattr(part, "text") and part.text:
-                            print(part.text, end="", flush=True)
+                            # Keep printing so you can watch it live in the terminal
+                            print(part.text, end="", flush=True) 
+                            # 2. Add the text chunk to our variable
+                            full_response += part.text 
             
             print("\n")
-            break 
+            return full_response # 3. Return the full string back to main.py!
             
         except Exception as e:
             error_str = str(e)
@@ -175,10 +175,12 @@ async def chat(query: str, runner, user_id, session_id):
                 print(f"\n⚠️ Rate limit hit (Attempt {attempt + 1}/{max_retries}).")
                 print(f"Waiting {retry_delay}s before retrying...")
                 await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                retry_delay *= 2  
             else:
                 print(f"\n A non-quota error occurred: {e}")
                 break
+    
+    return "" # Return empty string if all retries fail
 
 async def main():
     await init_session(APP_NAME, USER_ID, SESSION_ID)

@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KARMA — Kernel Optimizer</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:        #0a0b0d;
+  --bg2:       #0f1114;
+  --bg3:       #151719;
+  --border:    #1e2124;
+  --border2:   #2a2d32;
+  --green:     #00e5a0;
+  --green-dim: #00e5a020;
+  --green-mid: #00e5a040;
+  --amber:     #f5a623;
+  --amber-dim: #f5a62318;
+  --red:       #ff4d6a;
+  --blue:      #4d9fff;
+  --text:      #c8cdd4;
+  --text-dim:  #5a6170;
+  --text-mid:  #8892a0;
+  --mono:      'IBM Plex Mono', monospace;
+  --sans:      'IBM Plex Sans', sans-serif;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── HEADER ── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 52px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-mark {
+  width: 28px;
+  height: 28px;
+  border: 1.5px solid var(--green);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.logo-mark::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  background: var(--green);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.5; transform: scale(0.7); }
+}
+
+.logo-text {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.15em;
+  color: var(--green);
+}
+
+.logo-sub {
+  font-size: 10px;
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+  font-weight: 300;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: var(--text-dim);
+  letter-spacing: 0.06em;
+}
+
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.status-dot.offline { background: var(--red); animation: none; }
+.status-dot.thinking { background: var(--amber); }
+
+.gpu-badge {
+  font-size: 10px;
+  color: var(--text-dim);
+  border: 1px solid var(--border2);
+  padding: 3px 8px;
+  letter-spacing: 0.04em;
+}
+
+/* ── LAYOUT ── */
+.workspace {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* ── SIDEBAR ── */
+.sidebar {
+  width: 220px;
+  border-right: 1px solid var(--border);
+  background: var(--bg2);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.sidebar-section {
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar-label {
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--text-dim);
+  margin-bottom: 10px;
+  font-weight: 500;
+}
+
+.quick-cmd {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  font-size: 11px;
+  color: var(--text-mid);
+  cursor: pointer;
+  border: 1px solid transparent;
+  margin-bottom: 3px;
+  transition: all 0.15s;
+  font-family: var(--mono);
+  background: none;
+  width: 100%;
+  text-align: left;
+}
+
+.quick-cmd:hover {
+  background: var(--green-dim);
+  border-color: var(--green-mid);
+  color: var(--green);
+}
+
+.quick-cmd .cmd-icon {
+  font-size: 9px;
+  opacity: 0.5;
+  flex-shrink: 0;
+}
+
+.cmd-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.metrics-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.metric-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.metric-label { font-size: 10px; color: var(--text-dim); }
+
+.metric-value {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--green);
+}
+
+.metric-value.amber { color: var(--amber); }
+.metric-value.neutral { color: var(--text-mid); }
+
+.sidebar-spacer { flex: 1; }
+
+.model-switcher {
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}
+
+.model-select {
+  width: 100%;
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  color: var(--text-mid);
+  font-family: var(--mono);
+  font-size: 10px;
+  padding: 6px 8px;
+  cursor: pointer;
+  outline: none;
+  letter-spacing: 0.03em;
+}
+
+.model-select:focus { border-color: var(--green-mid); }
+
+/* ── CHAT AREA ── */
+.chat-area {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  scroll-behavior: smooth;
+}
+
+.messages::-webkit-scrollbar { width: 4px; }
+.messages::-webkit-scrollbar-track { background: transparent; }
+.messages::-webkit-scrollbar-thumb { background: var(--border2); }
+
+/* ── WELCOME ── */
+.welcome {
+  margin: auto;
+  text-align: center;
+  max-width: 420px;
+  padding: 40px 0;
+}
+
+.welcome-ascii {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--green);
+  margin-bottom: 24px;
+  opacity: 0.6;
+  white-space: pre;
+}
+
+.welcome-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: 0.05em;
+  margin-bottom: 8px;
+}
+
+.welcome-sub {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.7;
+  font-family: var(--sans);
+  font-weight: 300;
+  margin-bottom: 28px;
+}
+
+.welcome-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+}
+
+.chip {
+  font-size: 11px;
+  border: 1px solid var(--border2);
+  padding: 6px 12px;
+  color: var(--text-mid);
+  cursor: pointer;
+  transition: all 0.15s;
+  font-family: var(--mono);
+  background: none;
+}
+
+.chip:hover {
+  border-color: var(--green-mid);
+  color: var(--green);
+  background: var(--green-dim);
+}
+
+/* ── MESSAGES ── */
+.msg {
+  display: flex;
+  gap: 14px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border);
+  animation: fadeIn 0.2s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.msg:last-child { border-bottom: none; }
+
+.msg-avatar {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  margin-top: 2px;
+}
+
+.msg-avatar.user {
+  border: 1px solid var(--border2);
+  color: var(--text-dim);
+}
+
+.msg-avatar.agent {
+  border: 1px solid var(--green-mid);
+  color: var(--green);
+  background: var(--green-dim);
+}
+
+.msg-avatar.error {
+  border: 1px solid var(--red);
+  color: var(--red);
+}
+
+.msg-body { flex: 1; min-width: 0; }
+
+.msg-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.msg-author {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--text-mid);
+}
+
+.msg-author.agent { color: var(--green); }
+.msg-author.error { color: var(--red); }
+
+.msg-time {
+  font-size: 9px;
+  color: var(--text-dim);
+}
+
+.msg-content {
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  font-family: var(--sans);
+  font-weight: 300;
+}
+
+.msg-content p { margin-bottom: 10px; }
+.msg-content p:last-child { margin-bottom: 0; }
+
+.msg-content strong {
+  font-family: var(--mono);
+  font-weight: 500;
+  color: var(--text);
+  font-size: 12px;
+}
+
+/* ── CODE BLOCKS ── */
+.msg-content pre {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  border-left: 2px solid var(--green);
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 10px 0;
+  position: relative;
+}
+
+.msg-content pre::-webkit-scrollbar { height: 3px; }
+.msg-content pre::-webkit-scrollbar-thumb { background: var(--border2); }
+
+.msg-content code {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: #a8d8a8;
+  line-height: 1.6;
+}
+
+.msg-content :not(pre) > code {
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  padding: 1px 5px;
+  font-size: 11px;
+  color: var(--amber);
+}
+
+.copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: none;
+  border: 1px solid var(--border2);
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 9px;
+  padding: 3px 7px;
+  cursor: pointer;
+  letter-spacing: 0.05em;
+  transition: all 0.15s;
+}
+
+.copy-btn:hover { border-color: var(--green-mid); color: var(--green); }
+
+.lang-tag {
+  position: absolute;
+  top: 8px;
+  left: 14px;
+  font-size: 9px;
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+}
+
+/* ── THINKING ── */
+.thinking-msg .msg-content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-dim);
+  font-size: 12px;
+  font-family: var(--mono);
+}
+
+.thinking-dots {
+  display: flex;
+  gap: 4px;
+}
+
+.thinking-dots span {
+  width: 4px;
+  height: 4px;
+  background: var(--green);
+  border-radius: 50%;
+  animation: dot 1.2s ease-in-out infinite;
+}
+
+.thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes dot {
+  0%, 80%, 100% { opacity: 0.2; transform: scale(0.8); }
+  40% { opacity: 1; transform: scale(1); }
+}
+
+/* ── INPUT AREA ── */
+.input-area {
+  padding: 16px 24px 20px;
+  border-top: 1px solid var(--border);
+  background: var(--bg2);
+  flex-shrink: 0;
+}
+
+.input-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.input-wrap {
+  flex: 1;
+  position: relative;
+  background: var(--bg3);
+  border: 1px solid var(--border2);
+  transition: border-color 0.15s;
+}
+
+.input-wrap:focus-within {
+  border-color: var(--green-mid);
+}
+
+.input-prefix {
+  position: absolute;
+  left: 14px;
+  top: 14px;
+  font-size: 12px;
+  color: var(--green);
+  pointer-events: none;
+  font-weight: 500;
+}
+
+textarea {
+  width: 100%;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 12px 14px 12px 34px;
+  resize: none;
+  min-height: 46px;
+  max-height: 180px;
+  line-height: 1.5;
+}
+
+textarea::placeholder { color: var(--text-dim); }
+
+.send-btn {
+  width: 46px;
+  height: 46px;
+  background: var(--green);
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: all 0.15s;
+}
+
+.send-btn:hover { background: #00ffa8; }
+.send-btn:active { transform: scale(0.96); }
+.send-btn:disabled { background: var(--border2); cursor: not-allowed; }
+
+.send-btn svg { width: 16px; height: 16px; }
+
+.input-hint {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-top: 8px;
+  letter-spacing: 0.04em;
+}
+
+.input-hint kbd {
+  border: 1px solid var(--border2);
+  padding: 1px 4px;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+</style>
+</head>
+<body>
+
+<!-- ── HEADER ── -->
+<header>
+  <div class="logo">
+    <div class="logo-mark"></div>
+    <div>
+      <div class="logo-text">KARMA</div>
+      <div class="logo-sub">Kernel-Aware Retrieval Memory Agents</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="status-pill">
+      <div class="status-dot" id="statusDot"></div>
+      <span id="statusText">connecting...</span>
+    </div>
+    <div class="gpu-badge">RTX A4000 × 2</div>
+  </div>
+</header>
+
+<!-- ── WORKSPACE ── -->
+<div class="workspace">
+
+  <!-- ── SIDEBAR ── -->
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">QUICK COMMANDS</div>
+      <button class="quick-cmd" onclick="sendQuick('List all CUDA kernels in the kernels/ directory')">
+        <span class="cmd-icon">▸</span>
+        <span class="cmd-text">list kernels</span>
+      </button>
+      <button class="quick-cmd" onclick="sendQuick('Analyze sigmoid_kernel.cu and identify bottlenecks')">
+        <span class="cmd-icon">▸</span>
+        <span class="cmd-text">analyze sigmoid</span>
+      </button>
+      <button class="quick-cmd" onclick="sendQuick('Optimize vector_add.cu for sm_86 Ampere architecture')">
+        <span class="cmd-icon">▸</span>
+        <span class="cmd-text">optimize vector_add</span>
+      </button>
+      <button class="quick-cmd" onclick="sendQuick('Show me the profiling results from the last optimization run')">
+        <span class="cmd-icon">▸</span>
+        <span class="cmd-text">show profile results</span>
+      </button>
+      <button class="quick-cmd" onclick="sendQuick('What optimizations have been stored in the KnowledgeBase?')">
+        <span class="cmd-icon">▸</span>
+        <span class="cmd-text">query knowledgebase</span>
+      </button>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">SESSION METRICS</div>
+      <div class="metrics-grid">
+        <div class="metric-item">
+          <span class="metric-label">kernels processed</span>
+          <span class="metric-value neutral" id="metricKernels">0</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">best speedup</span>
+          <span class="metric-value" id="metricSpeedup">—</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">compile passes</span>
+          <span class="metric-value" id="metricPasses">0</span>
+        </div>
+        <div class="metric-item">
+          <span class="metric-label">kb entries</span>
+          <span class="metric-value neutral" id="metricKB">0</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-spacer"></div>
+
+    <div class="model-switcher">
+      <div class="sidebar-label" style="margin-bottom:6px">ACTIVE MODEL</div>
+      <select class="model-select" id="modelSelect">
+        <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+        <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+        <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
+        <option value="claude-opus-4-6">claude-opus-4-6</option>
+      </select>
+    </div>
+  </aside>
+
+  <!-- ── CHAT ── -->
+  <div class="chat-area">
+    <div class="messages" id="messages">
+      <div class="welcome" id="welcome">
+        <div class="welcome-ascii">╔═══════════════════════════╗
+║  K A R M A  v0.1.0-alpha  ║
+╚═══════════════════════════╝</div>
+        <div class="welcome-title">CUDA Optimization Agent</div>
+        <div class="welcome-sub">
+          Send a kernel to optimize, ask about profiling results,<br>
+          or use the quick commands on the left.
+        </div>
+        <div class="welcome-chips">
+          <button class="chip" onclick="sendQuick('What CUDA kernels are available to optimize?')">list kernels</button>
+          <button class="chip" onclick="sendQuick('Explain the KARMA optimization pipeline')">how it works</button>
+          <button class="chip" onclick="sendQuick('Optimize sigmoid_kernel.cu using shared memory and warp shuffle')">optimize sigmoid</button>
+          <button class="chip" onclick="sendQuick('What is my best speedup so far?')">best result</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div class="input-row">
+        <div class="input-wrap">
+          <span class="input-prefix">›</span>
+          <textarea
+            id="userInput"
+            placeholder="ask the agent, paste a kernel, describe a bottleneck..."
+            rows="1"
+            onkeydown="handleKey(event)"
+            oninput="autoResize(this)"
+          ></textarea>
+        </div>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">
+          <svg viewBox="0 0 16 16" fill="none" stroke="#0a0b0d" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 8H3M8 3l5 5-5 5"/>
+          </svg>
+        </button>
+      </div>
+      <div class="input-hint">
+        <kbd>Enter</kbd> to send &nbsp;·&nbsp; <kbd>Shift+Enter</kbd> for new line &nbsp;·&nbsp; <kbd>↑</kbd> to recall last message
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── STATE ──────────────────────────────────────────────────────────────
+let ws = null;
+let isThinking = false;
+let lastMessage = '';
+let metrics = { kernels: 0, speedup: null, passes: 0, kb: 0 };
+
+// ── WEBSOCKET ──────────────────────────────────────────────────────────
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
+
+  ws.onopen = () => {
+    setStatus('online');
+  };
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    if (data.type === 'status' && data.text === 'thinking') {
+      showThinking();
+    } else if (data.type === 'response') {
+      removeThinking();
+      appendMessage('agent', data.text);
+      parseMetrics(data.text);
+      setStatus('online');
+    } else if (data.type === 'error') {
+      removeThinking();
+      appendMessage('error', `Error: ${data.text}`);
+      setStatus('online');
+    }
+  };
+
+  ws.onclose = () => {
+    setStatus('offline');
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => setStatus('offline');
+}
+
+// ── STATUS ─────────────────────────────────────────────────────────────
+function setStatus(state) {
+  const dot = document.getElementById('statusDot');
+  const txt = document.getElementById('statusText');
+  dot.className = 'status-dot ' + (state === 'online' ? '' : state === 'offline' ? 'offline' : 'thinking');
+  txt.textContent = state === 'online' ? 'agent ready' : state === 'offline' ? 'reconnecting...' : 'thinking...';
+}
+
+// ── SEND ───────────────────────────────────────────────────────────────
+function sendMessage() {
+  const input = document.getElementById('userInput');
+  const text = input.value.trim();
+  if (!text || isThinking || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  lastMessage = text;
+  hideWelcome();
+  appendMessage('user', text);
+  input.value = '';
+  input.style.height = 'auto';
+  setStatus('thinking');
+  isThinking = true;
+  document.getElementById('sendBtn').disabled = true;
+
+  ws.send(JSON.stringify({
+    message: text,
+    model: document.getElementById('modelSelect').value
+  }));
+}
+
+function sendQuick(text) {
+  document.getElementById('userInput').value = text;
+  sendMessage();
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+  if (e.key === 'ArrowUp' && !document.getElementById('userInput').value) {
+    document.getElementById('userInput').value = lastMessage;
+    autoResize(document.getElementById('userInput'));
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 180) + 'px';
+}
+
+// ── MESSAGES ───────────────────────────────────────────────────────────
+function hideWelcome() {
+  const w = document.getElementById('welcome');
+  if (w) w.remove();
+}
+
+function appendMessage(role, text) {
+  isThinking = false;
+  document.getElementById('sendBtn').disabled = false;
+
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = `msg ${role === 'error' ? 'error-msg' : ''}`;
+
+  const avatar = role === 'user' ? 'YOU' : role === 'error' ? 'ERR' : 'AI';
+  const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+  div.innerHTML = `
+    <div class="msg-avatar ${role === 'agent' ? 'agent' : role === 'error' ? 'error' : 'user'}">${avatar}</div>
+    <div class="msg-body">
+      <div class="msg-meta">
+        <span class="msg-author ${role}">${role === 'user' ? 'USER' : role === 'error' ? 'ERROR' : 'KARMA'}</span>
+        <span class="msg-time">${time}</span>
+      </div>
+      <div class="msg-content">${renderContent(text)}</div>
+    </div>
+  `;
+
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+
+  // attach copy handlers
+  div.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.onclick = () => {
+      navigator.clipboard.writeText(btn.dataset.code);
+      btn.textContent = 'copied';
+      setTimeout(() => btn.textContent = 'copy', 1500);
+    };
+  });
+}
+
+function showThinking() {
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg thinking-msg';
+  div.id = 'thinkingMsg';
+  div.innerHTML = `
+    <div class="msg-avatar agent">AI</div>
+    <div class="msg-body">
+      <div class="msg-meta">
+        <span class="msg-author agent">KARMA</span>
+      </div>
+      <div class="msg-content">
+        <div class="thinking-dots"><span></span><span></span><span></span></div>
+        <span style="font-size:11px;color:var(--text-dim)">processing kernel...</span>
+      </div>
+    </div>
+  `;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function removeThinking() {
+  const t = document.getElementById('thinkingMsg');
+  if (t) t.remove();
+}
+
+// ── RENDER MARKDOWN-LIKE CONTENT ───────────────────────────────────────
+function renderContent(text) {
+  // escape HTML first
+  let out = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  // code blocks with lang tag + copy button
+  out = out.replace(/```(\w+)?\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const id = Math.random().toString(36).slice(2, 7);
+    const escaped = code.trim();
+    return `<pre><span class="lang-tag">${lang || 'code'}</span><button class="copy-btn" data-code="${escaped.replace(/"/g, '&quot;')}">copy</button><code>${escaped}</code></pre>`;
+  });
+
+  // inline code
+  out = out.replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  // bold
+  out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+
+  // bullet lists
+  out = out.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
+  out = out.replace(/(<li>.*<\/li>)/gs, '<ul style="padding-left:16px;margin:6px 0">$1</ul>');
+
+  // line breaks to paragraphs
+  const paras = out.split(/\n\n+/);
+  if (paras.length > 1) {
+    out = paras.map(p => p.trim() ? `<p>${p.replace(/\n/g, '<br>')}</p>` : '').join('');
+  } else {
+    out = out.replace(/\n/g, '<br>');
+  }
+
+  return out;
+}
+
+// ── PARSE METRICS FROM RESPONSE ────────────────────────────────────────
+function parseMetrics(text) {
+  // look for speedup mentions like "2.3x" or "1.8x speedup"
+  const speedupMatch = text.match(/(\d+\.?\d*)x\s+speedup/i) || text.match(/speedup[:\s]+(\d+\.?\d*)x/i);
+  if (speedupMatch) {
+    const val = parseFloat(speedupMatch[1]);
+    if (!metrics.speedup || val > metrics.speedup) {
+      metrics.speedup = val;
+      document.getElementById('metricSpeedup').textContent = val.toFixed(2) + 'x';
+    }
+  }
+
+  if (text.toLowerCase().includes('compilation successful') || text.toLowerCase().includes('compiled')) {
+    metrics.passes++;
+    document.getElementById('metricPasses').textContent = metrics.passes;
+  }
+
+  if (text.toLowerCase().includes('kernel') && text.toLowerCase().includes('optimiz')) {
+    metrics.kernels++;
+    document.getElementById('metricKernels').textContent = metrics.kernels;
+  }
+}
+
+// ── INIT ───────────────────────────────────────────────────────────────
+connect();
+document.getElementById('userInput').focus();
+</script>
+</body>
+</html>
