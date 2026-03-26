@@ -1,0 +1,57 @@
+// transpose_pytorch.cu
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define TILE_DIM 32
+#define BLOCK_ROWS 8
+
+__global__ void transposeSharedKernel(float *odata, const float *idata, int width, int height) {
+    __shared__ float tile[TILE_DIM][TILE_DIM + 1];
+
+    int x = blockIdx.x * TILE_DIM + threadIdx.x;
+    int y = blockIdx.y * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < width && (y + j) < height) {
+            tile[threadIdx.y + j][threadIdx.x] = idata[(y + j) * width + x];
+        }
+    }
+
+    __syncthreads();
+
+    x = blockIdx.y * TILE_DIM + threadIdx.x;
+    y = blockIdx.x * TILE_DIM + threadIdx.y;
+
+    for (int j = 0; j < TILE_DIM; j += BLOCK_ROWS) {
+        if (x < height && (y + j) < width) {
+            odata[(y + j) * height + x] = tile[threadIdx.x][threadIdx.y + j];
+        }
+    }
+}
+
+// 2. The PyTorch C++ Wrapper
+torch::Tensor transpose_cuda(torch::Tensor input) {
+    const int height = input.size(0);
+    const int width = input.size(1);
+    
+    // PyTorch allocates the output memory dynamically on the GPU
+    auto output = torch::empty({width, height}, input.options());
+
+    dim3 dimBlock(TILE_DIM, BLOCK_ROWS, 1);
+    dim3 dimGrid((width + TILE_DIM - 1) / TILE_DIM, (height + TILE_DIM - 1) / TILE_DIM, 1);
+
+    // Extract the raw data pointers using .data_ptr<float>()
+    transposeSharedKernel<<<dimGrid, dimBlock>>>(
+        output.data_ptr<float>(), 
+        input.data_ptr<float>(), 
+        width, 
+        height
+    );
+
+    return output;
+}
+
+// 3. Pybind11 Binding (Exposes the C++ function to Python)
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("transpose", &transpose_cuda, "Shared Memory Matrix Transpose (CUDA)");
+}
