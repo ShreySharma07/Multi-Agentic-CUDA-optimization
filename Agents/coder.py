@@ -14,6 +14,8 @@ from google.adk.runners import Runner
 from google.genai import types
 from google.adk.sessions import InMemorySessionService
 from google.adk.errors import already_exists_error
+from tools.getfiles import getFiles
+from tools.readfiles import readFile
 
 
 import warnings
@@ -22,7 +24,7 @@ warnings.filterwarnings("ignore")
 import logging
 logging.basicConfig(level=logging.ERROR)
 
-DIRECTORY_PATH = Path("kernelpractise")
+DIRECTORY_PATH = Path("kernels")
 # CUDA_PATH = "kernelpractise/sigmoid_kernel.cu"
 
 # try:
@@ -43,7 +45,7 @@ DIRECTORY_PATH = Path("kernelpractise")
 
 
 
-AGENT_MODEL = 'gemini-3-flash-preview'
+AGENT_MODEL = 'gemini-2.5-flash'
 
 PROMPT = f"""
 You are a CUDA optimization expert.
@@ -80,7 +82,7 @@ agent = Agent(
     model = AGENT_MODEL,
     description="inspect cuda kernel",
     instruction=PROMPT,
-    tools=[]
+    tools=[getFiles, readFile]
 )
 
 session_service = InMemorySessionService()
@@ -116,13 +118,21 @@ async def init_session(app_name: str, user_id: str, session_id: str):
         print(f"Using existing session: {session_id}")
     return session
 
-session = asyncio.run(init_session(APP_NAME,USER_ID,SESSION_ID))
+# session = asyncio.run(init_session(APP_NAME,USER_ID,SESSION_ID))
 
 runner = Runner(
     agent = agent,
     app_name=APP_NAME,
     session_service=session_service
 )
+
+_session_initialized = False
+
+async def ensure_session():
+    global _session_initialized
+    if not _session_initialized:
+        await init_session(APP_NAME, USER_ID, SESSION_ID)
+        _session_initialized = True
 
 print(f"Runner created for agent '{runner.agent.name}'.")
 
@@ -147,40 +157,22 @@ print(f"Runner created for agent '{runner.agent.name}'.")
 #     print(f"<<< Agent Response: {final_response_text}")
 
 async def chat(query: str, runner, user_id, session_id):
-    print(f"\n >>> User Query: {query}")
+    await ensure_session()
     content = types.Content(role='user', parts=[types.Part.from_text(text=query)])
     
-    max_retries = 3
-    retry_delay = 10  
+    final_text = ""
     
-    for attempt in range(max_retries):
-        try:
-            full_response = "" # 1. Create a variable to hold the complete response
-            
-            async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=content):
-                if event.content and event.content.parts:
-                    for part in event.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            # Keep printing so you can watch it live in the terminal
-                            print(part.text, end="", flush=True) 
-                            # 2. Add the text chunk to our variable
-                            full_response += part.text 
-            
-            print("\n")
-            return full_response # 3. Return the full string back to main.py!
-            
-        except Exception as e:
-            error_str = str(e)
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                print(f"\n⚠️ Rate limit hit (Attempt {attempt + 1}/{max_retries}).")
-                print(f"Waiting {retry_delay}s before retrying...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  
-            else:
-                print(f"\n A non-quota error occurred: {e}")
-                break
+    async for event in runner.run_async(
+        user_id=user_id,
+        session_id=session_id,
+        new_message=content
+    ):
+        if event.content and event.content.parts:
+            for part in event.content.parts:
+                if hasattr(part, 'text') and part.text and part.text.strip():
+                    final_text += part.text  # += to concatenate both final parts
     
-    return "" # Return empty string if all retries fail
+    return final_text if final_text.strip() else "Agent produced no output."
 
 async def main():
     await init_session(APP_NAME, USER_ID, SESSION_ID)

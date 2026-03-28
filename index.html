@@ -573,6 +573,97 @@ textarea::placeholder { color: var(--text-dim); }
   font-family: var(--mono);
   font-size: 9px;
 }
+
+/* ── OPTIMIZATION PANEL ── */
+.opt-panel {
+  width: 0;
+  border-left: 1px solid var(--border);
+  background: var(--bg2);
+  display: flex;
+  flex-direction: column;
+  flex-shrink: 0;
+  overflow: hidden;
+  transition: width 0.3s ease;
+}
+.opt-panel.open { width: 340px; }
+
+.opt-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+.opt-title { font-size: 11px; font-weight: 600; color: var(--green); letter-spacing: .08em; }
+.opt-kernel { font-size: 10px; color: var(--text-dim); margin-top: 2px; }
+.opt-close {
+  background: none; border: none; color: var(--text-dim);
+  cursor: pointer; font-size: 14px; padding: 2px 6px;
+  font-family: var(--mono);
+}
+.opt-close:hover { color: var(--text); }
+
+.opt-body { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 12px; }
+.opt-body::-webkit-scrollbar { width: 3px; }
+.opt-body::-webkit-scrollbar-thumb { background: var(--border2); }
+
+/* progress bar */
+.opt-progress-wrap { }
+.opt-progress-label { font-size: 9px; color: var(--text-dim); letter-spacing: .1em; margin-bottom: 6px; display: flex; justify-content: space-between; }
+.opt-progress-bar { height: 2px; background: var(--border); }
+.opt-progress-fill { height: 100%; background: var(--green); transition: width .4s ease; width: 0%; }
+
+/* round pills */
+.opt-pills { display: flex; flex-wrap: wrap; gap: 5px; }
+.opt-pill {
+  font-size: 9px; padding: 3px 9px;
+  border: 1px solid var(--border2);
+  color: var(--text-dim); letter-spacing: .04em;
+  transition: all .2s;
+}
+.opt-pill.active  { border-color: #f5a62360; color: var(--amber); background: #f5a62310; }
+.opt-pill.ok      { border-color: #00e5a040; color: var(--green); background: #00e5a010; }
+.opt-pill.fail    { border-color: #ff4d6a40; color: var(--red);   background: #ff4d6a10; }
+
+/* stat cards */
+.opt-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.opt-stat {
+  background: var(--bg3); border: 1px solid var(--border);
+  padding: 10px 12px;
+}
+.opt-stat-label { font-size: 9px; color: var(--text-dim); letter-spacing: .08em; margin-bottom: 4px; }
+.opt-stat-value { font-size: 20px; font-weight: 600; color: var(--green); line-height: 1; }
+.opt-stat-value.amber { color: var(--amber); }
+.opt-stat-value.dim   { color: var(--text-mid); }
+.opt-stat-sub { font-size: 9px; color: var(--text-dim); margin-top: 3px; }
+
+/* chart */
+.opt-chart-wrap { background: var(--bg3); border: 1px solid var(--border); padding: 12px; }
+.opt-chart-label { font-size: 9px; color: var(--text-dim); letter-spacing: .08em; margin-bottom: 8px; }
+.opt-chart svg { width: 100%; height: 90px; display: block; }
+
+/* log */
+.opt-log { background: var(--bg3); border: 1px solid var(--border); padding: 10px 12px; flex: 1; min-height: 120px; }
+.opt-log-label { font-size: 9px; color: var(--text-dim); letter-spacing: .08em; margin-bottom: 8px; }
+.opt-log-entries { overflow-y: auto; max-height: 180px; }
+.opt-log-entries::-webkit-scrollbar { width: 2px; }
+.opt-log-entries::-webkit-scrollbar-thumb { background: var(--border2); }
+.opt-log-row { display: flex; gap: 8px; font-size: 10px; line-height: 1.8; }
+.opt-log-t { color: var(--text-dim); flex-shrink: 0; font-size: 9px; }
+.opt-log-msg { color: var(--text-mid); }
+.opt-log-msg.ok   { color: var(--green); }
+.opt-log-msg.fail { color: var(--red); }
+.opt-log-msg.info { color: var(--amber); }
+
+/* complete banner */
+.opt-complete {
+  background: #00e5a015; border: 1px solid #00e5a040;
+  padding: 12px 14px; display: none;
+}
+.opt-complete.show { display: block; }
+.opt-complete-title { font-size: 11px; color: var(--green); font-weight: 600; margin-bottom: 4px; }
+.opt-complete-sub { font-size: 10px; color: var(--text-dim); }
 </style>
 </head>
 <body>
@@ -704,6 +795,69 @@ textarea::placeholder { color: var(--text-dim); }
     </div>
   </div>
 
+  <!-- ── OPTIMIZATION PANEL ── -->
+  <div class="opt-panel" id="optPanel">
+    <div class="opt-header">
+      <div>
+        <div class="opt-title">OPTIMIZATION LOOP</div>
+        <div class="opt-kernel" id="optKernelName">—</div>
+      </div>
+      <button class="opt-close" onclick="closeOptPanel()">✕</button>
+    </div>
+    <div class="opt-body">
+      <div class="opt-progress-wrap">
+        <div class="opt-progress-label">
+          <span>PROGRESS</span>
+          <span id="optRoundLabel">0 / 0</span>
+        </div>
+        <div class="opt-progress-bar"><div class="opt-progress-fill" id="optProgressFill"></div></div>
+      </div>
+      <div class="opt-pills" id="optPills"></div>
+      <div class="opt-stats">
+        <div class="opt-stat">
+          <div class="opt-stat-label">BASELINE</div>
+          <div class="opt-stat-value dim" id="optBaseline">—</div>
+          <div class="opt-stat-sub">original ms</div>
+        </div>
+        <div class="opt-stat">
+          <div class="opt-stat-label">BEST SPEEDUP</div>
+          <div class="opt-stat-value" id="optBestSpeedup">—</div>
+          <div class="opt-stat-sub" id="optBestRound">no result yet</div>
+        </div>
+        <div class="opt-stat">
+          <div class="opt-stat-label">CURRENT ROUND</div>
+          <div class="opt-stat-value amber" id="optCurrentRound">—</div>
+          <div class="opt-stat-sub" id="optStrategy" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">—</div>
+        </div>
+        <div class="opt-stat">
+          <div class="opt-stat-label">COMPILE OK</div>
+          <div class="opt-stat-value" id="optPasses">0</div>
+          <div class="opt-stat-sub" id="optFails">0 failures</div>
+        </div>
+      </div>
+      <div class="opt-chart-wrap">
+        <div class="opt-chart-label">SPEEDUP PER ROUND</div>
+        <svg viewBox="0 0 290 80" id="optChart">
+          <line x1="0" y1="64" x2="290" y2="64" stroke="#1e2124" stroke-width="1"/>
+          <line x1="0" y1="40" x2="290" y2="40" stroke="#1e2124" stroke-width="0.5" stroke-dasharray="2 3"/>
+          <line x1="0" y1="16" x2="290" y2="16" stroke="#1e2124" stroke-width="0.5" stroke-dasharray="2 3"/>
+          <text x="2" y="67" fill="#5a6170" font-size="6" font-family="monospace">1.0x</text>
+          <text x="2" y="43" fill="#5a6170" font-size="6" font-family="monospace">2.0x</text>
+          <text x="2" y="19" fill="#5a6170" font-size="6" font-family="monospace">3.0x</text>
+          <g id="optChartBars"></g>
+        </svg>
+      </div>
+      <div class="opt-complete" id="optComplete">
+        <div class="opt-complete-title" id="optCompleteTitle">optimization complete</div>
+        <div class="opt-complete-sub" id="optCompleteSub">—</div>
+      </div>
+      <div class="opt-log">
+        <div class="opt-log-label">LIVE LOG</div>
+        <div class="opt-log-entries" id="optLogEntries"></div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -724,17 +878,49 @@ function connect() {
 
   ws.onmessage = (e) => {
     const data = JSON.parse(e.data);
+
     if (data.type === 'status' && data.text === 'thinking') {
       showThinking();
+
     } else if (data.type === 'response') {
       removeThinking();
       appendMessage('agent', data.text);
       parseMetrics(data.text);
       setStatus('online');
+      isThinking = false;
+      document.getElementById('sendBtn').disabled = false;
+
     } else if (data.type === 'error') {
       removeThinking();
       appendMessage('error', `Error: ${data.text}`);
       setStatus('online');
+      isThinking = false;
+      document.getElementById('sendBtn').disabled = false;
+
+    // ── OPTIMIZATION PANEL MESSAGE TYPES ──
+    } else if (data.type === 'opt_start') {
+      openOptPanel(data.kernel, data.rounds);
+
+    } else if (data.type === 'opt_progress') {
+      optLog(data.text, data.cls || '');
+      if (data.round) optSetRound(data.round, data.total, data.strategy || '');
+
+    } else if (data.type === 'opt_result') {
+      optRoundResult(data.round, data.total, data.speedup, data.passed, data.strategy);
+      if (data.baseline) document.getElementById('optBaseline').textContent = data.baseline.toFixed(2) + 'ms';
+
+    } else if (data.type === 'opt_complete') {
+      optComplete(data.best_speedup, data.best_round, data.file);
+      setStatus('online');
+      isThinking = false;
+      document.getElementById('sendBtn').disabled = false;
+
+    } else if (data.type === 'kernel_list') {
+      removeThinking();
+      appendKernelList(data.kernels);
+      setStatus('online');
+      isThinking = false;
+      document.getElementById('sendBtn').disabled = false;
     }
   };
 
@@ -920,6 +1106,146 @@ function parseMetrics(text) {
     metrics.kernels++;
     document.getElementById('metricKernels').textContent = metrics.kernels;
   }
+}
+
+// ── OPTIMIZATION PANEL ────────────────────────────────────────────────
+let optState = { rounds: 0, passes: 0, fails: 0, bestSpeedup: null };
+
+function openOptPanel(kernel, rounds) {
+  optState = { rounds, passes: 0, fails: 0, bestSpeedup: null };
+  document.getElementById('optPanel').classList.add('open');
+  document.getElementById('optKernelName').textContent = kernel || '—';
+  document.getElementById('optRoundLabel').textContent = `0 / ${rounds}`;
+  document.getElementById('optProgressFill').style.width = '0%';
+  document.getElementById('optChartBars').innerHTML = '';
+  document.getElementById('optLogEntries').innerHTML = '';
+  document.getElementById('optComplete').classList.remove('show');
+  document.getElementById('optBestSpeedup').textContent = '—';
+  document.getElementById('optBestRound').textContent = 'no result yet';
+  document.getElementById('optBaseline').textContent = '—';
+  document.getElementById('optPasses').textContent = '0';
+  document.getElementById('optFails').textContent = '0 failures';
+  document.getElementById('optCurrentRound').textContent = '—';
+  document.getElementById('optStrategy').textContent = '—';
+  const pills = document.getElementById('optPills');
+  pills.innerHTML = '';
+  for (let i = 1; i <= rounds; i++) {
+    const p = document.createElement('div');
+    p.className = 'opt-pill';
+    p.id = 'optpill-' + i;
+    p.textContent = 'round ' + i;
+    pills.appendChild(p);
+  }
+}
+
+function closeOptPanel() {
+  document.getElementById('optPanel').classList.remove('open');
+}
+
+function optLog(text, cls) {
+  const el = document.getElementById('optLogEntries');
+  const t = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const row = document.createElement('div');
+  row.className = 'opt-log-row';
+  row.innerHTML = `<span class="opt-log-t">${t}</span><span class="opt-log-msg ${cls}">${text}</span>`;
+  el.appendChild(row);
+  el.scrollTop = el.scrollHeight;
+}
+
+function optSetRound(round, total, strategy) {
+  document.getElementById('optRoundLabel').textContent = `${round} / ${total}`;
+  document.getElementById('optCurrentRound').textContent = `${round} / ${total}`;
+  document.getElementById('optStrategy').textContent = strategy;
+  const pill = document.getElementById('optpill-' + round);
+  if (pill) { document.querySelectorAll('.opt-pill.active').forEach(p => p.classList.remove('active')); pill.classList.add('active'); }
+}
+
+function optRoundResult(round, total, speedup, passed, strategy) {
+  const pill = document.getElementById('optpill-' + round);
+  if (pill) { pill.classList.remove('active'); pill.classList.add(passed ? 'ok' : 'fail'); }
+  document.getElementById('optProgressFill').style.width = `${(round / total) * 100}%`;
+
+  const bars = document.getElementById('optChartBars');
+  const barW = 30, gap = 8;
+  const x = 22 + (round - 1) * (barW + gap);
+  const maxSp = 3.0;
+  const barH = passed ? Math.max(4, Math.min(48, ((speedup - 1) / (maxSp - 1)) * 48)) : 4;
+  const barY = 64 - barH;
+  const color = !passed ? '#ff4d6a' : speedup >= 2 ? '#00e5a0' : '#f5a623';
+
+  const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  rect.setAttribute('x', x); rect.setAttribute('y', barY);
+  rect.setAttribute('width', barW); rect.setAttribute('height', barH);
+  rect.setAttribute('fill', color); rect.setAttribute('opacity', '0.85');
+  bars.appendChild(rect);
+
+  if (passed && speedup) {
+    const lbl = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    lbl.setAttribute('x', x + barW / 2); lbl.setAttribute('y', barY - 3);
+    lbl.setAttribute('text-anchor', 'middle'); lbl.setAttribute('fill', color);
+    lbl.setAttribute('font-size', '6'); lbl.setAttribute('font-family', 'monospace');
+    lbl.textContent = speedup.toFixed(2) + 'x';
+    bars.appendChild(lbl);
+
+    if (!optState.bestSpeedup || speedup > optState.bestSpeedup) {
+      optState.bestSpeedup = speedup;
+      document.getElementById('optBestSpeedup').textContent = speedup.toFixed(2) + 'x';
+      document.getElementById('optBestRound').textContent = `round ${round}`;
+      metrics.speedup = speedup;
+      document.getElementById('metricSpeedup').textContent = speedup.toFixed(2) + 'x';
+    }
+    optState.passes++;
+    document.getElementById('optPasses').textContent = optState.passes;
+    metrics.passes = optState.passes;
+    document.getElementById('metricPasses').textContent = optState.passes;
+  } else {
+    optState.fails++;
+    document.getElementById('optFails').textContent = `${optState.fails} failure${optState.fails > 1 ? 's' : ''}`;
+  }
+}
+
+function optComplete(bestSpeedup, bestRound, file) {
+  const el = document.getElementById('optComplete');
+  el.classList.add('show');
+  document.getElementById('optCompleteTitle').textContent = `best speedup: ${bestSpeedup ? bestSpeedup.toFixed(2) + 'x' : '—'}`;
+  document.getElementById('optCompleteSub').textContent = `round ${bestRound} · saved ${file || 'best_optimized.cu'}`;
+  document.getElementById('optProgressFill').style.width = '100%';
+  metrics.kernels++;
+  document.getElementById('metricKernels').textContent = metrics.kernels;
+  optLog(`complete — best ${bestSpeedup ? bestSpeedup.toFixed(2) + 'x' : '—'} in round ${bestRound}`, 'ok');
+}
+
+// ── KERNEL LIST CARD ──────────────────────────────────────────────────
+function appendKernelList(kernels) {
+  hideWelcome();
+  const msgs = document.getElementById('messages');
+  const div = document.createElement('div');
+  div.className = 'msg';
+  const time = new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const items = kernels.map(k => {
+    const name = k.split('/').pop();
+    return `<button onclick="startOptimization('${k}')" style="display:flex;align-items:center;gap:10px;width:100%;background:var(--bg3);border:1px solid var(--border2);color:var(--text-mid);font-family:var(--mono);font-size:11px;padding:8px 12px;cursor:pointer;margin-bottom:5px;text-align:left;transition:all .15s" onmouseover="this.style.borderColor='var(--green-mid)';this.style.color='var(--green)'" onmouseout="this.style.borderColor='var(--border2)';this.style.color='var(--text-mid)'"><span style="color:var(--green);font-size:9px">▸</span>${name}</button>`;
+  }).join('');
+  div.innerHTML = `
+    <div class="msg-avatar agent">AI</div>
+    <div class="msg-body">
+      <div class="msg-meta"><span class="msg-author agent">KARMA</span><span class="msg-time">${time}</span></div>
+      <div class="msg-content">
+        <p style="margin-bottom:10px;font-size:12px;font-family:var(--sans)">Found ${kernels.length} kernel${kernels.length !== 1 ? 's' : ''}. Click one to start the optimization loop:</p>
+        ${items}
+      </div>
+    </div>`;
+  msgs.appendChild(div);
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function startOptimization(kernelPath) {
+  hideWelcome();
+  appendMessage('user', `optimize ${kernelPath.split('/').pop()}`);
+  setStatus('thinking');
+  isThinking = true;
+  document.getElementById('sendBtn').disabled = true;
+  ws.send(JSON.stringify({ message: `__optimize__:${kernelPath}`, model: document.getElementById('modelSelect').value }));
 }
 
 // ── INIT ───────────────────────────────────────────────────────────────

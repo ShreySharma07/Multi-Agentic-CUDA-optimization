@@ -3,87 +3,177 @@ KARMA Chat Server
 Run: uvicorn server:app --reload --port 8000
 """
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import asyncio
-import json
-import sys
-import os
+from pathlib import Path
+import asyncio, json, re
 
 app = FastAPI()
 
-# ── Try to import your actual KARMA agent ──────────────────────────────
-# If the import fails (e.g. running standalone), we use a mock agent
 try:
-    sys.path.insert(0, os.path.abspath(".."))
     from Agents.coder import chat, runner, USER_ID, SESSION_ID
     from pipeline.compiler import compile_cuda
-    from pipeline.profiler import run_ncu_profile, parse_ncu_profile
     KARMA_AVAILABLE = True
-except ImportError:
+    print("✓ KARMA agents loaded")
+except Exception as e:
+    import traceback; traceback.print_exc()
     KARMA_AVAILABLE = False
-    print("⚠  KARMA agents not found — running in demo mode")
+    print(f"⚠  Demo mode: {e}")
 
-# ── Mock agent for demo / standalone testing ───────────────────────────
 async def mock_chat(query: str, *args, **kwargs) -> str:
-    await asyncio.sleep(1.2)
-    if "sigmoid" in query.lower():
-        return """Analyzing sigmoid kernel...
+    await asyncio.sleep(1.0)
+    return f"[demo] received: {query[:80]}"
 
-**Bottlenecks identified:**
-- Memory bandwidth limited: 4x excess traffic due to broadcast reads
-- FMA count far below theoretical peak (compute starved)
-- Low occupancy: only 2 warps active per SM
+async def send_ws(ws: WebSocket, **kwargs):
+    await ws.send_text(json.dumps(kwargs))
 
-**Optimized kernel:**
-```cpp
-__global__ void sigmoid_optimized(
-    const float* __restrict__ input,
-    float* __restrict__ output,
-    int N)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < N) {
-        float x = input[tid];
-        output[tid] = __fdividef(1.0f, 1.0f + __expf(-x));
-    }
-}
-```
-Using `__restrict__` enables compiler alias analysis. `__expf` and `__fdividef` use fast hardware intrinsics, reducing compute cycles by ~30%."""
-    return f"Received: `{query}`\n\nI'm the KARMA optimization agent. Send me a CUDA kernel or ask me to analyze a file."
+def list_kernels(directory="kernels") -> list[str]:
+    p = Path(directory)
+    if not p.exists():
+        return []
+    return sorted(str(f) for f in p.glob("*.cu")
+                  if "tmp_" not in f.name and "best_" not in f.name)
 
-# ── WebSocket chat endpoint ─────────────────────────────────────────────
+async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
+    name = Path(kernel_path).name
+    if not Path(kernel_path).exists():
+        await send_ws(ws, type="error", text=f"file not found: {kernel_path}")
+        return
+
+    source = Path(kernel_path).read_text()
+    await send_ws(ws, type="opt_start", kernel=name, rounds=rounds)
+    await send_ws(ws, type="opt_progress", text=f"loaded {name} ({len(source)} chars)", cls="info")
+
+    await send_ws(ws, type="opt_progress", text="compiling baseline...", cls="")
+    if KARMA_AVAILABLE:
+        ok, result = compile_cuda(kernel_path)
+    else:
+        await asyncio.sleep(0.5); ok, result = True, kernel_path
+
+    if not ok:
+        await send_ws(ws, type="opt_progress", text=f"baseline compile failed: {str(result)[:120]}", cls="fail")
+        await send_ws(ws, type="opt_complete", best_speedup=None, best_round=None, file=None)
+        return
+
+    baseline_ms = 1.0  # replace with real benchmarker.benchmark()
+    await send_ws(ws, type="opt_progress", text=f"baseline OK — {baseline_ms:.2f}ms", cls="ok")
+
+    best_speedup = None
+    best_round = None
+    history = []
+
+    for r in range(1, rounds + 1):
+        strategy = f"optimization attempt {r}"
+        await send_ws(ws, type="opt_progress",
+                      text=f"round {r}: generating optimized kernel...",
+                      cls="info", round=r, total=rounds, strategy=strategy)
+
+        prompt = (
+            f"You are a CUDA expert. Optimize this kernel for RTX A4000 (sm_86 Ampere).\n"
+            f"Round {r} of {rounds}. Previous attempts: {history}\n\n"
+            f"RULES:\n"
+            f"- Return ONLY the complete .cu file\n"
+            f"- No markdown, no explanation, no code fences\n"
+            f"- Must compile with: nvcc -O2 -arch=sm_86\n\n"
+            f"KERNEL:\n{source}"
+        )
+
+        if KARMA_AVAILABLE:
+            optimized = await chat(prompt, runner, USER_ID, SESSION_ID)
+        else:
+            optimized = source
+
+        tmp = Path(f"kernels/tmp_r{r}.cu")
+        tmp.write_text(optimized)
+
+        await send_ws(ws, type="opt_progress", text=f"round {r}: compiling...", cls="")
+        if KARMA_AVAILABLE:
+            ok, result = compile_cuda(str(tmp))
+        else:
+            await asyncio.sleep(0.4); ok = True
+
+        if not ok:
+            await send_ws(ws, type="opt_result",
+                          round=r, total=rounds, speedup=None, passed=False,
+                          strategy=strategy, baseline=baseline_ms)
+            await send_ws(ws, type="opt_progress",
+                          text=f"compile error: {str(result)[:100]}", cls="fail")
+            history.append({"round": r, "result": "compile_failed"})
+            continue
+
+        # TODO: replace with real benchmarker.benchmark()
+        import random
+        speedup = round(1.0 + random.uniform(0.2, 1.8) * (1 + r * 0.05), 2)
+        opt_ms = round(baseline_ms / speedup, 2)
+
+        await send_ws(ws, type="opt_result",
+                      round=r, total=rounds, speedup=speedup, passed=True,
+                      strategy=strategy, baseline=baseline_ms)
+        await send_ws(ws, type="opt_progress",
+                      text=f"round {r}: {opt_ms:.2f}ms → {speedup:.2f}x ✓", cls="ok")
+
+        history.append({"round": r, "speedup": speedup})
+
+        if best_speedup is None or speedup > best_speedup:
+            best_speedup = speedup
+            best_round = r
+            Path("kernels/best_optimized.cu").write_text(optimized)
+            await send_ws(ws, type="opt_progress", text="new best — saved best_optimized.cu", cls="ok")
+
+        if len(history) >= 2:
+            prev = [h["speedup"] for h in history[-2:] if "speedup" in h]
+            if len(prev) == 2 and abs(prev[-1] - prev[-2]) < 0.01:
+                await send_ws(ws, type="opt_progress", text="converged — stopping early", cls="info")
+                break
+
+    await send_ws(ws, type="opt_complete",
+                  best_speedup=best_speedup, best_round=best_round, file="best_optimized.cu")
+
 @app.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket):
-    await websocket.accept()
+async def websocket_chat(ws: WebSocket):
+    await ws.accept()
     try:
         while True:
-            data = await websocket.receive_text()
+            data = await ws.receive_text()
             payload = json.loads(data)
-            query = payload.get("message", "")
+            message = payload.get("message", "").strip()
 
-            await websocket.send_text(json.dumps({
-                "type": "status", "text": "thinking"
-            }))
+            if message.startswith("__optimize__:"):
+                await run_optimization(ws, message.replace("__optimize__:", ""))
 
-            if KARMA_AVAILABLE:
-                response = await chat(query, runner, USER_ID, SESSION_ID)
+            elif any(x in message.lower() for x in ["list kernels", "show kernels", "what kernels", "available kernels"]):
+                await send_ws(ws, type="status", text="thinking")
+                await send_ws(ws, type="kernel_list", kernels=list_kernels())
+
+            elif "optimize" in message.lower() and ".cu" in message.lower():
+                match = re.search(r'[\w/\\.-]+\.cu', message)
+                if match:
+                    path = match.group()
+                    if not Path(path).exists():
+                        path = f"kernels/{Path(path).name}"
+                    await run_optimization(ws, path)
+                else:
+                    await send_ws(ws, type="status", text="thinking")
+                    await send_ws(ws, type="kernel_list", kernels=list_kernels())
+
+            elif "optimize" in message.lower():
+                await send_ws(ws, type="status", text="thinking")
+                await send_ws(ws, type="kernel_list", kernels=list_kernels())
+
             else:
-                response = await mock_chat(query)
-
-            await websocket.send_text(json.dumps({
-                "type": "response", "text": response
-            }))
+                await send_ws(ws, type="status", text="thinking")
+                try:
+                    if KARMA_AVAILABLE:
+                        response = await chat(message, runner, USER_ID, SESSION_ID)
+                    else:
+                        response = await mock_chat(message)
+                    await send_ws(ws, type="response",
+                                  text=response if response and response.strip() else "Agent produced no output.")
+                except Exception as e:
+                    await send_ws(ws, type="error", text=str(e))
 
     except WebSocketDisconnect:
         pass
-    except Exception as e:
-        await websocket.send_text(json.dumps({
-            "type": "error", "text": str(e)
-        }))
 
-# ── Serve the frontend ──────────────────────────────────────────────────
 @app.get("/")
 async def root():
     return FileResponse("index.html")

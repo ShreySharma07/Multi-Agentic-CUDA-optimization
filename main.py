@@ -35,7 +35,7 @@ async def main():
     print("=== KARMA MVP Optimization Loop ===")
     
     # 1. Deterministic File Selection (No AI here)
-    target_file = Path("kernels/sigmoid_kernel.cu")
+    target_file = Path("kernels")
     if not target_file.exists():
         print(f"Error: Could not find {target_file}")
         return
