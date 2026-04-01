@@ -70,12 +70,12 @@ async def main():
         success, result = compile_cuda(str(temp_file))
         
         if success:
-            print(f"[Round {attempt}] Compilation Successful! ✅")
+            print(f"[Round {attempt}] Compilation Successful!")
             executable_path = result
             compile_success = True
             break # Exit the loop, we have a working binary!
         else:
-            print(f"[Round {attempt}] Compilation Failed. ❌ Feeding error back to Agent...")
+            print(f"[Round {attempt}] Compilation Failed. Feeding error back to Agent...")
             # 4. The Feedback Loop: Tell the LLM exactly why it failed
             current_prompt = (
                 f"Your previous code failed to compile with the following error:\n"
@@ -94,11 +94,11 @@ async def main():
         else:
             # Parse the CSV output into a clean dictionary
             metrics = parse_ncu_profile(profile_raw["profile"])
-            print("\n📊 Optimization Results:")
+            print("\n Optimization Results:")
             for key, value in metrics["metrics"].items():
                 print(f"  - {key}: {value}")
     else:
-        print("\n❌ Optimization failed: Could not produce a compiling kernel after maximum retries.")
+        print("\n Optimization failed: Could not produce a compiling kernel after maximum retries.")
 
 if __name__ == "__main__":
     asyncio.run(main())
