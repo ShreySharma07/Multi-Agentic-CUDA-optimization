@@ -75,7 +75,6 @@ def parse_ncu_profile(profile_csv: str):
             except ValueError:
                 continue # Skip rows that don't have numeric values
             
-            # 3. Match against the metrics we care about for KARMA
             if "Achieved Occupancy" in m_name or "sm__warps_active" in m_name:
                 metrics["occupancy"] = m_val
             elif "DRAM Throughput" in m_name or "dram__throughput" in m_name:

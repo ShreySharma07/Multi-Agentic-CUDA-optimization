@@ -5,7 +5,7 @@ def find_cuda_tool(tool_name: str) -> str:
     """
     Dynamically hunts for CUDA tools (nvcc, ncu) even if sudo strips the PATH.
     """
-    # 1. Try normal system PATH first
+    # 1. normal system PATH first
     path = shutil.which(tool_name)
     if path: 
         return path

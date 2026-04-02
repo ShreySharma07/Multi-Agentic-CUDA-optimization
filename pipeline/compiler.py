@@ -8,12 +8,11 @@ def get_gpu_arch():
     return f"sm_{major}{minor}"
 
 def compile_cuda(file_path: str):
-    # Force absolute paths so it works from anywhere
+    # absolute paths so it works from anywhere
     abs_file_path = os.path.abspath(file_path)
     executable = abs_file_path.replace(".cu", "")
     arch = get_gpu_arch()
     
-    # THE FIX: Exact path based on your lab computer
     nvcc_path = utils.find_cuda_tool('nvcc')
     
     cmd = [nvcc_path, abs_file_path, '-o', executable, '-O3', f'-arch={arch}', '-lineinfo']
@@ -25,7 +24,7 @@ def compile_cuda(file_path: str):
             print(f"Compilation successful for {arch}")
             return (True, executable) 
         else:
-            # Capture stdout just in case nvcc hides the error there
+            # stdout just in case nvcc hides the error there
             error_msg = process.stderr.strip() or process.stdout.strip()
             return (False, error_msg)
             
