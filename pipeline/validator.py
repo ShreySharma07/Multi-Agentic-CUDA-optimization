@@ -22,14 +22,17 @@ def run_validation(executable_path: str) -> tuple[bool, str]:
 
         output = result.stdout.strip() + "\n" + result.stderr.strip()
         
-        # ---------------------------------------------------------
-        # 1. Check if the binary crashed (result.returncode != 0)
-        # 2. Check the 'output' string for keywords that indicate success or failure.
-        #    (e.g., if "SUCCESS" is in the output, return True. 
-        #           if "Error" or "FAILURE" is in the output, return False).
-        # ---------------------------------------------------------
+        if result.returncode != 0:
+            return False, f"Binary crashed during execution. Exit code {result.returncode}.\nOutput: {output}"
         
-        return False, "Validation logic not yet implemented."
+        output_upper = output.upper()
+        
+        if "SUCCESS" in output_upper:
+            return True, "Math validation passed."
+        elif "FAILURE" in output_upper or "ERROR" in output_upper:
+            return False, f"Math validation failed. Output:\n{output}"
+        else:
+            return False, f"Validation logic missing. The kernel must print 'SUCCESS' if correct. Output was:\n{output}"
         
     except subprocess.TimeoutExpired:
         return False, "Validation timed out. The kernel likely contains an infinite loop or deadlock."
