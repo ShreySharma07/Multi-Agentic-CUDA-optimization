@@ -1,61 +1,103 @@
 #include <iostream>
+#include <cstdio>
+#include <cstdlib>
+#include <algorithm>
+#include <vector>
+#include <chrono>
+#include <cmath>
 #include <cuda_runtime.h>
-#include <cstdlib> // For rand()
 
-// CUDA kernel for vector addition
-// Added __restrict__ keyword to inform the compiler that pointers do not alias,
-// which can enable more aggressive optimizations related to memory access.
-__global__ void vectorAdd(const float *__restrict__ A, const float *__restrict__ B, float *__restrict__ C, int numElements) {
-    int i = blockDim.x * blockIdx.x + threadIdx.x;
-    if (i < numElements) {
-        C[i] = A[i] + B[i];
+__global__ void SigmoidActivation(const float* __restrict__ inputs, const float* __restrict__ weights, const float* __restrict__ bias, int numNeurons, int inputSize, float* __restrict__ output) {
+    int neuronIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (neuronIdx < numNeurons) {
+        const float* weightRow = weights + (size_t)neuronIdx * inputSize;
+        float z = 0.0f;
+        
+        int i = 0;
+        for (; i <= inputSize - 8; i += 8) {
+            float4 w1 = reinterpret_cast<const float4*>(weightRow + i)[0];
+            float4 w2 = reinterpret_cast<const float4*>(weightRow + i + 4)[0];
+            float4 in = reinterpret_cast<const float4*>(inputs + i)[0];
+            float4 in2 = reinterpret_cast<const float4*>(inputs + i + 4)[0];
+            
+            z += w1.x * in.x + w1.y * in.y + w1.z * in.z + w1.w * in.w;
+            z += w2.x * in2.x + w2.y * in2.y + w2.z * in2.z + w2.w * in2.w;
+        }
+        
+        for (; i < inputSize; i++) {
+            z += weightRow[i] * inputs[i];
+        }
+
+        z += bias[neuronIdx];
+        output[neuronIdx] = 1.0f / (1.0f + expf(-z));
     }
 }
 
-int main() {
-    int numElements = 50000;
-    size_t size = numElements * sizeof(float);
-
-    // Allocate host memory
-    float *h_A = (float *)malloc(size);
-    float *h_B = (float *)malloc(size);
-    float *h_C = (float *)malloc(size);
-
-    // Initialize host arrays
-    for (int i = 0; i < numElements; ++i) {
-        h_A[i] = rand() / (float)RAND_MAX;
-        h_B[i] = rand() / (float)RAND_MAX;
+void serialSigmoid(float* inputs, float* weights, float* bias, int numNeurons, int inputSize, float* output){
+    for (int j = 0; j < numNeurons; j++) {
+        double z = 0.0;
+        for (int i = 0; i < inputSize; i++) {
+            z += (double)inputs[i] * (double)weights[j * inputSize + i];
+        }
+        z += (double)bias[j];
+        output[j] = 1.0f / (1.0f + exp(-z));
     }
+}
 
-    // Allocate device memory
-    float *d_A, *d_B, *d_C;
-    cudaMalloc((void **)&d_A, size);
-    cudaMalloc((void **)&d_B, size);
-    cudaMalloc((void **)&d_C, size);
+int main(){
+    int numNeurons = 10000;
+    int inputSize = 1024;
+    size_t sizeWeights = (size_t)numNeurons * inputSize * sizeof(float);
+    size_t sizeInputs = (size_t)inputSize * sizeof(float);
+    size_t sizeBias = (size_t)numNeurons * sizeof(float);
+    size_t sizeOutput = (size_t)numNeurons * sizeof(float);
 
-    // Copy data from host to device
-    cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+    float *h_inputs = (float*)malloc(sizeInputs);
+    float *h_weights = (float*)malloc(sizeWeights);
+    float *h_bias = (float*)malloc(sizeBias);
+    float *h_output = (float*)malloc(sizeOutput);
+    float *h_cpu = (float*)malloc(sizeOutput);
 
-    // Launch the kernel
-    int threadsPerBlock = 256;
-    int blocksPerGrid = (numElements + threadsPerBlock - 1) / threadsPerBlock;
-    vectorAdd<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numElements);
+    for(int i=0; i<inputSize; i++) h_inputs[i] = (float)rand()/RAND_MAX;
+    for(int i=0; i<numNeurons*inputSize; i++) h_weights[i] = ((float)rand()/RAND_MAX) - 0.5f;
+    for(int i=0; i<numNeurons; i++) h_bias[i] = (float)rand()/RAND_MAX * 0.01f;
 
-    // Wait for GPU to finish
+    float *d_inputs, *d_weights, *d_bias, *d_output;
+    cudaMalloc(&d_inputs, sizeInputs);
+    cudaMalloc(&d_weights, sizeWeights);
+    cudaMalloc(&d_bias, sizeBias);
+    cudaMalloc(&d_output, sizeOutput);
+
+    cudaMemcpy(d_inputs, h_inputs, sizeInputs, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_weights, h_weights, sizeWeights, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bias, h_bias, sizeBias, cudaMemcpyHostToDevice);
+
+    int threads = 256;
+    int blocks = (numNeurons + threads - 1) / threads;
+    
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start); cudaEventCreate(&stop);
+    cudaEventRecord(start);
+    SigmoidActivation<<<blocks, threads>>>(d_inputs, d_weights, d_bias, numNeurons, inputSize, d_output);
+    cudaEventRecord(stop);
     cudaDeviceSynchronize();
+    
+    float ms; cudaEventElapsedTime(&ms, start, stop);
+    cudaMemcpy(h_output, d_output, sizeOutput, cudaMemcpyDeviceToHost);
 
-    // Copy result back to host
-    cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+    serialSigmoid(h_inputs, h_weights, h_bias, numNeurons, inputSize, h_cpu);
 
-    // Free memory
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-    free(h_A);
-    free(h_B);
-    free(h_C);
+    bool success = true;
+    for(int i = 0; i < numNeurons; i++){
+        if(std::abs(h_output[i] - h_cpu[i]) > 1e-3f * std::max(1.0f, std::max(std::abs(h_output[i]), std::abs(h_cpu[i])))){
+            printf("Error at neuron %d: GPU=%f, CPU=%f\n", i, h_output[i], h_cpu[i]);
+            success = false; break;
+        }
+    }
+    if(success) printf("SUCCESS: GPU Time: %f ms\n", ms);
 
-    std::cout << "Vector addition completed successfully!" << std::endl;
+    cudaFree(d_inputs); cudaFree(d_weights); cudaFree(d_bias); cudaFree(d_output);
+    free(h_inputs); free(h_weights); free(h_bias); free(h_output); free(h_cpu);
     return 0;
 }

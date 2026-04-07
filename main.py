@@ -12,30 +12,32 @@ from pipeline.compiler import compile_cuda
 from pipeline.profiler import run_ncu_profile, parse_ncu_profile
 
 # Import your agent setup (assuming you exposed an 'ask_coder' function or similar)
-from Agents.coder import chat, runner, USER_ID, SESSION_ID
+from Agents.coder import chat, runner, USER_ID, SESSION_ID, safe_chat
 
 # A helper function to strip the markdown formatting from the LLM response
 def extract_cuda_code(llm_response: str) -> str:
     """Extracts raw C++ code from markdown block with safety checks."""
-    # 1. Safety check: Did the LLM actually return a string?
-    if not llm_response or not isinstance(llm_response, str):
-        return ""
+    # # 1. Safety check: Did the LLM actually return a string?
+    # if not llm_response or not isinstance(llm_response, str):
+    #     return ""
 
-    # 2. Extract the code
-    if "```cpp" in llm_response:
-        code = llm_response.split("```cpp")[1].split("```")[0]
-        return code.strip()
-    elif "```cuda" in llm_response:
-        code = llm_response.split("```cuda")[1].split("```")[0]
-        return code.strip()
+    # # 2. Extract the code
+    # if "```cpp" in llm_response:
+    #     code = llm_response.split("```cpp")[1].split("```")[0]
+    #     return code.strip()
+    # elif "```cuda" in llm_response:
+    #     code = llm_response.split("```cuda")[1].split("```")[0]
+    #     return code.strip()
     
+    # return llm_response.strip()
     return llm_response.strip()
 
 async def main():
     print("=== KARMA MVP Optimization Loop ===")
     
     # 1. Deterministic File Selection (No AI here)
-    target_file = Path("kernels")
+    files = list(Path("kernels").glob("*.cu"))
+    target_file = files[0]
     if not target_file.exists():
         print(f"Error: Could not find {target_file}")
         return
@@ -55,7 +57,7 @@ async def main():
         print(f"\n[Round {attempt}/{max_retries}] Asking CoderAgent for optimizations...")
         
         # Call your agent (Make sure your chat() function returns the string!)
-        response_text = await chat(current_prompt, runner, USER_ID, SESSION_ID)
+        response_text = await safe_chat(current_prompt, runner, USER_ID, SESSION_ID)
         
         # Extract the raw code and save it to a temporary file
         optimized_code = extract_cuda_code(response_text)

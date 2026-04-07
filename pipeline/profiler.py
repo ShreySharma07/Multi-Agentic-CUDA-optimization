@@ -2,7 +2,7 @@ import subprocess
 import csv
 import io
 import os
-import utils
+from . import utils
 
 def run_ncu_profile(binary: str):
     # 1. Convert to an absolute path to prevent NCU pathing bugs

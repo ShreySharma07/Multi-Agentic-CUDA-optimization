@@ -25,43 +25,16 @@ import logging
 logging.basicConfig(level=logging.ERROR)
 
 DIRECTORY_PATH = Path("kernels")
-# CUDA_PATH = "kernelpractise/sigmoid_kernel.cu"
 
-# try:
-#     if os.path.exists(CUDA_PATH):
-#         with open(CUDA_PATH, 'r') as f:
-#             cuda_code = f.read()
-# except Exception as e:
-#     print(e)
-
-# try:
-#     if os.path.exists(PROFILE_PATH):
-#         with open(PROFILE_PATH, 'r') as f:
-#             profile = f.read()
-# except Exception as e:
-#     print(e)
-
-# os.environ['GOOGLE_API_KEY'] = 'GOOGLE_API'
-
-
-
-AGENT_MODEL = 'gemini-2.5-flash'
+AGENT_MODEL = "gemini-3.1-flash-lite-preview"
 
 PROMPT = f"""
-You are a CUDA optimization expert.
+You are a CUDA optimization expert for RTX A4000 (sm_86).
 
-GPU: RTX A4000 16GB (Ampere architecture)
 
 CUDA files are located in:
 {DIRECTORY_PATH}
 
-Workflow:
-
-1. Use getFiles to list CUDA files.
-2. Ask the user which file to analyze.
-3. Use readFile to read the selected CUDA file.
-4. Identify the biggest performance bottlenecks.
-5. Rewrite the CUDA kernel with optimizations.
 
 IMPORTANT RULES:
 
@@ -74,7 +47,27 @@ IMPORTANT RULES:
 Final output format:
 
 1. Short explanation of bottlenecks
-2. Fully optimized CUDA kernel
+
+When asked to optimize a kernel, you MUST follow this output format with zero exceptions:
+- Output ONLY the raw .cu file content
+- Begin with the first #include line
+- End with the closing brace of main()
+- Zero explanation before or after the code
+- Zero markdown, zero backticks, zero "cppcopy", zero comments about what you changed
+- If you write even one word outside the code, the pipeline breaks
+
+You may think through the optimization internally, but your response must contain ONLY compilable CUDA code.
+VALIDATION RULE (VERY IMPORTANT):
+
+- When comparing GPU vs CPU results:
+    Use tolerance-based comparison:
+    
+    abs(gpu - cpu) <= 1e-3 * max(1.0, abs(gpu), abs(cpu))
+
+- DO NOT use strict equality
+- DO NOT use very small tolerance like 1e-6
+- Print "SUCCESS" only if all values satisfy tolerance
+- Otherwise print "FAILURE" printf("ERROR at index %d: GPU=%f CPU=%f DIFF=%f\n", i, gpu, cpu, fabs(gpu-cpu));
 """
 
 agent = Agent(
@@ -90,15 +83,6 @@ session_service = InMemorySessionService()
 APP_NAME = 'CUDA'
 USER_ID = 'user_1'
 SESSION_ID = 'session_001'
-
-# async def init_session(app_name:str,user_id:str,session_id:str) -> InMemorySessionService:
-#     session = await session_service.create_session(
-#         app_name=app_name,
-#         user_id=user_id,
-#         session_id=session_id
-#     )
-#     print(f"Session created: App='{app_name}', User='{user_id}', Session='{session_id}'")
-#     return session
 
 async def init_session(app_name: str, user_id: str, session_id: str):
     try:
@@ -173,6 +157,28 @@ async def chat(query: str, runner, user_id, session_id):
                     final_text += part.text  # += to concatenate both final parts
     
     return final_text if final_text.strip() else "Agent produced no output."
+
+import asyncio
+
+async def safe_chat(prompt, runner, user_id, session_id):
+    max_retries = 5
+    
+    for attempt in range(max_retries):
+        try:
+            return await chat(prompt, runner, user_id, session_id)
+        
+        except Exception as e:
+            error_str = str(e)
+            
+            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+                wait_time = 50  # or parse from error
+                
+                print(f"[RATE LIMIT] Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            else:
+                raise e
+    
+    return "Agent failed due to repeated rate limits."
 
 async def main():
     await init_session(APP_NAME, USER_ID, SESSION_ID)

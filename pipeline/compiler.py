@@ -1,7 +1,7 @@
 import subprocess
 import torch
 import os
-import utils
+from . import utils
 
 def get_gpu_arch():
     major, minor = torch.cuda.get_device_capability()

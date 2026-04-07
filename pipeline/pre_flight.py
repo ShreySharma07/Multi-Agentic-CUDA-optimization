@@ -1,9 +1,8 @@
 import hashlib
 import pathlib
-import compiler, profiler
+from . import compiler, profiler, cache
 import json
 import os
-import cache
 
 def pre_flight(source_code : str)->dict:
     hashed_code = hashlib.sha256(source_code.encode('utf-8')).hexdigest()
@@ -41,9 +40,9 @@ def pre_flight(source_code : str)->dict:
 
         profiler_raw = profiler.run_ncu_profile(executable)
 
-        if "error" in profiler_raw:
+        if isinstance(profiler_raw, dict) and "error" in profiler_raw:
             return {
-                "status":"Error",
+                "status":"error",
                 "stage":"profiler",
                 "hash": hashed_code,
                 "error_message": profiler_raw["error"]
