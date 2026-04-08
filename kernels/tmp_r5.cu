@@ -1,101 +1,81 @@
 #include <iostream>
-#include <cstdio>
-#include <cstdlib>
-#include <algorithm>
-#include <vector>
-#include <chrono>
-#include <cmath>
 #include <cuda_runtime.h>
 
-__global__ void SigmoidActivation(const float* __restrict__ inputs, const float* __restrict__ weights, const float* __restrict__ bias, int numNeurons, int inputSize, float* __restrict__ output) {
-    int neuronIdx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (neuronIdx >= numNeurons) return;
-
-    const float* weightRow = weights + (size_t)neuronIdx * inputSize;
-    float z = 0.0f;
+__global__ void vectorAdd(const float * __restrict__ A, const float * __restrict__ B, float * __restrict__ C, int numElements) {
+    int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    int stride = blockDim.x * gridDim.x * 4;
     
-    int i = 0;
-    #pragma unroll 8
-    for (; i <= inputSize - 8; i += 8) {
-        float4 w1 = reinterpret_cast<const float4*>(weightRow + i)[0];
-        float4 w2 = reinterpret_cast<const float4*>(weightRow + i + 4)[0];
-        float4 in1 = reinterpret_cast<const float4*>(inputs + i)[0];
-        float4 in2 = reinterpret_cast<const float4*>(inputs + i + 4)[0];
-        z += w1.x * in1.x + w1.y * in1.y + w1.z * in1.z + w1.w * in1.w;
-        z += w2.x * in2.x + w2.y * in2.y + w2.z * in2.z + w2.w * in2.w;
+    #pragma unroll
+    for (int j = i; j < (numElements & ~3); j += stride) {
+        float4 a = reinterpret_cast<const float4*>(A + j)[0];
+        float4 b = reinterpret_cast<const float4*>(B + j)[0];
+        float4 c;
+        c.x = a.x + b.x;
+        c.y = a.y + b.y;
+        c.z = a.z + b.z;
+        c.w = a.w + b.w;
+        reinterpret_cast<float4*>(C + j)[0] = c;
     }
-    for (; i < inputSize; i++) {
-        z += weightRow[i] * inputs[i];
-    }
-
-    z += bias[neuronIdx];
-    output[neuronIdx] = 1.0f / (1.0f + expf(-z));
-}
-
-void serialSigmoid(float* inputs, float* weights, float* bias, int numNeurons, int inputSize, float* output){
-    for (int j = 0; j < numNeurons; j++) {
-        double z = 0.0;
-        for (int i = 0; i < inputSize; i++) {
-            z += (double)inputs[i] * (double)weights[j * inputSize + i];
+    
+    int remaining = numElements & 3;
+    if (remaining > 0) {
+        int base = (numElements & ~3);
+        int j = base + (blockIdx.x * blockDim.x + threadIdx.x);
+        if (j < numElements) {
+            C[j] = A[j] + B[j];
         }
-        z += (double)bias[j];
-        output[j] = 1.0f / (1.0f + exp(-z));
     }
 }
 
-int main(){
-    int numNeurons = 10000;
-    int inputSize = 1024;
-    size_t sizeWeights = (size_t)numNeurons * inputSize * sizeof(float);
-    size_t sizeInputs = (size_t)inputSize * sizeof(float);
-    size_t sizeBias = (size_t)numNeurons * sizeof(float);
-    size_t sizeOutput = (size_t)numNeurons * sizeof(float);
+int main() {
+    int numElements = 50000;
+    size_t size = numElements * sizeof(float);
 
-    float *h_inputs = (float*)malloc(sizeInputs);
-    float *h_weights = (float*)malloc(sizeWeights);
-    float *h_bias = (float*)malloc(sizeBias);
-    float *h_output = (float*)malloc(sizeOutput);
-    float *h_cpu = (float*)malloc(sizeOutput);
+    float *h_A = (float *)malloc(size);
+    float *h_B = (float *)malloc(size);
+    float *h_C = (float *)malloc(size);
+    float *h_Ref = (float *)malloc(size);
 
-    for(int i=0; i<inputSize; i++) h_inputs[i] = (float)rand()/RAND_MAX;
-    for(int i=0; i<numNeurons*inputSize; i++) h_weights[i] = ((float)rand()/RAND_MAX) - 0.5f;
-    for(int i=0; i<numNeurons; i++) h_bias[i] = (float)rand()/RAND_MAX * 0.01f;
+    for (int i = 0; i < numElements; ++i) {
+        h_A[i] = rand() / (float)RAND_MAX;
+        h_B[i] = rand() / (float)RAND_MAX;
+        h_Ref[i] = h_A[i] + h_B[i];
+    }
 
-    float *d_inputs, *d_weights, *d_bias, *d_output;
-    cudaMalloc(&d_inputs, sizeInputs);
-    cudaMalloc(&d_weights, sizeWeights);
-    cudaMalloc(&d_bias, sizeBias);
-    cudaMalloc(&d_output, sizeOutput);
+    float *d_A, *d_B, *d_C;
+    cudaMalloc((void **)&d_A, size);
+    cudaMalloc((void **)&d_B, size);
+    cudaMalloc((void **)&d_C, size);
 
-    cudaMemcpy(d_inputs, h_inputs, sizeInputs, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_weights, h_weights, sizeWeights, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bias, h_bias, sizeBias, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
 
-    int threads = 128;
-    int blocks = (numNeurons + threads - 1) / threads;
-    
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start); cudaEventCreate(&stop);
-    cudaEventRecord(start);
-    SigmoidActivation<<<blocks, threads>>>(d_inputs, d_weights, d_bias, numNeurons, inputSize, d_output);
-    cudaEventRecord(stop);
+    int threadsPerBlock = 256;
+    int blocksPerGrid = 128; 
+    vectorAdd<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numElements);
+
     cudaDeviceSynchronize();
-    
-    float ms; cudaEventElapsedTime(&ms, start, stop);
-    cudaMemcpy(h_output, d_output, sizeOutput, cudaMemcpyDeviceToHost);
-
-    serialSigmoid(h_inputs, h_weights, h_bias, numNeurons, inputSize, h_cpu);
+    cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
 
     bool success = true;
-    for(int i = 0; i < numNeurons; i++){
-        if(std::abs(h_output[i] - h_cpu[i]) > 1e-3f * std::max(1.0f, std::max(std::abs(h_output[i]), std::abs(h_cpu[i])))){
-            printf("Error at neuron %d: GPU=%f, CPU=%f\n", i, h_output[i], h_cpu[i]);
-            success = false; break;
+    for (int i = 0; i < numElements; ++i) {
+        float diff = std::abs(h_C[i] - h_Ref[i]);
+        if (diff > 1e-3 * std::max(1.0f, std::max(std::abs(h_C[i]), std::abs(h_Ref[i])))) {
+            printf("ERROR at index %d: GPU=%f CPU=%f DIFF=%f\n", i, h_C[i], h_Ref[i], diff);
+            success = false;
+            break;
         }
     }
-    if(success) printf("SUCCESS: GPU Time: %f ms\n", ms);
 
-    cudaFree(d_inputs); cudaFree(d_weights); cudaFree(d_bias); cudaFree(d_output);
-    free(h_inputs); free(h_weights); free(h_bias); free(h_output); free(h_cpu);
+    if (success) printf("SUCCESS\n");
+
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    free(h_Ref);
+
     return 0;
 }

@@ -79,20 +79,12 @@ def list_kernels(directory="kernels") -> list[str]:
     )
 
 def extract_cuda_code(text: str) -> str:
-    # handle various fence styles including "cppcopy"
-    for fence in ["```cpp", "```cuda", "```c", "cppcopy", "```"]:
-        if fence in text:
-            after = text.split(fence, 1)[1]
-            # find closing fence or end of string
-            end = after.find("```")
-            return (after[:end] if end != -1 else after).strip()
-    # no fences — check if it looks like CUDA
-    if "#include" in text or "__global__" in text:
-        # find the start of actual code
-        for marker in ["#include", "__global__"]:
-            idx = text.find(marker)
-            if idx != -1:
-                return text[idx:].strip()
+    text = text.replace("cppcopy", "")
+    text = text.replace("```", "")
+
+    if "#include" in text:
+        return text[text.find("#include"):].strip()
+
     return text.strip()
 
 # ── Pre-flight analysis ────────────────────────────────────────────────
@@ -176,6 +168,48 @@ async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
 
     await send_ws(ws, type="opt_progress",
                   text=f"baseline: {baseline_ms:.2f}ms (replace with real benchmarker)", cls="")
+    
+
+    hint = "unknown"
+
+    try:
+        occ_val = float(occ)
+        dram_val = float(dram)
+
+        if dram_val > 50:
+            hint = "memory-bound"
+        elif occ_val < 40:
+            hint = "low-occupancy"
+        else:
+            hint = "compute-bound"
+    except:
+        pass
+
+    strategy_hint = ""
+
+    if hint == "memory-bound":
+        strategy_hint = """
+    Focus on:
+    - coalesced global memory access
+    - vectorized loads (float4)
+    - shared memory usage
+    """
+
+    elif hint == "compute-bound":
+        strategy_hint = """
+    Focus on:
+    - fast math (__expf, __fdividef)
+    - loop unrolling
+    - reducing branch divergence
+    """
+
+    elif hint == "low-occupancy":
+        strategy_hint = """
+    Focus on:
+    - increasing threads per block
+    - reducing register usage
+    - improving parallelism
+    """
 
     best_speedup = None
     best_round = None
@@ -207,26 +241,44 @@ async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
         if best_speedup:
             best_ctx = f"Best version so far achieved {best_speedup:.2f}x speedup.\n"
 
+        best_perf_line = ""
+        if best_speedup is not None:
+            best_perf_line = f"- The current best kernel achieves {best_speedup:.2f}x speedup\n"
 
         prompt = (
             f"You are a CUDA expert optimizing for RTX A4000 (sm_86 Ampere).\n"
             f"This is round {r} of {rounds}.\n\n"
+            f"Optimization hint: This kernel is {hint}.\n"
+            f"{strategy_hint}\n"
             f"IMPORTANT CONSTRAINTS:\n"
             f"- Use float32 only. Do NOT use half, half2, __half, or fp16 types.\n"
             f"- Do NOT use cuda/std::complex or cuda/cmath headers.\n"
             f"- All inputs, weights, outputs are float*\n\n"
+            f"IMPORTANT:\n"
+            f"- Apply ONLY ONE optimization at a time\n"
+            f"- Do NOT rewrite entire kernel\n"
+            f"- Maintain correctness strictly\n\n"
             f"{metrics_ctx}\n"
             f"{history_ctx}"
             f"{best_ctx}\n"
-            f"STRICT OUTPUT RULES — follow exactly:\n"
-            f"- Return ONLY the complete .cu file content\n"
+            f"STRICT OUTPUT RULES — MUST FOLLOW:"
+
+            f"- Output ONLY raw CUDA code"
+            f"""- DO NOT include:
+            - explanations
+            - markdown (no ``` or cppcopy)
+            - comments outside code
+            - First character MUST be '#'
+            - If output is not valid CUDA code, it will be rejected"""
+
+            f"Return ONLY the .cu file."
             f"- No markdown fences (no ```), no explanation, no preamble\n"
             f"- Start immediately with #include\n"
             f"- Must compile with: nvcc -O2 -arch=sm_86\n"
             f"- If previous rounds failed to compile, fix those exact errors\n\n"
             f"KERNEL TO OPTIMIZE:\n{best_code}"
             f"IMPORTANT:\n"
-            f"- The current best kernel achieves {best_speedup:.2f}x speedup\n"
+            f"- The current best kernel achieves {best_perf_line}x speedup\n"
             f"- Your goal is to IMPROVE it further\n"
             f"- If unsure, make SMALL incremental improvements\n"
             f"- Do NOT degrade performance\n\n"
@@ -246,6 +298,11 @@ async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
 
         tmp = Path(f"kernels/tmp_r{r}.cu")
         tmp.write_text(optimized)
+
+        if not optimized.startswith("#include"):
+            await send_ws(ws, type="opt_progress",
+                text="invalid CUDA output — skipping round", cls="fail")
+            continue
 
         # compile
         await send_ws(ws, type="opt_progress", text=f"round {r}: compiling...", cls="")
@@ -341,6 +398,8 @@ async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
         summary = (
             f"**Optimization complete: `{name}`**\n\n"
             f"- Best speedup: **{best_speedup:.2f}x** (round {best_round})\n"
+            f"- The current best kernel achieves {best_speedup:.2f}x speedup\n"
+            if best_speedup is not None else ""
             f"- Rounds completed: {len(history)}\n"
             f"- Compile failures: {n_compile}\n"
             f"- Validation failures: {n_val}\n"

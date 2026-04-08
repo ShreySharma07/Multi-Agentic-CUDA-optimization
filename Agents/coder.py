@@ -45,16 +45,16 @@ IMPORTANT RULES:
 - Do not stop after explaining optimizations.
 
 Final output format:
+STRICT OUTPUT RULES — MUST FOLLOW:
 
-1. Short explanation of bottlenecks
-
-When asked to optimize a kernel, you MUST follow this output format with zero exceptions:
-- Output ONLY the raw .cu file content
-- Begin with the first #include line
-- End with the closing brace of main()
-- Zero explanation before or after the code
-- Zero markdown, zero backticks, zero "cppcopy", zero comments about what you changed
-- If you write even one word outside the code, the pipeline breaks
+- Output ONLY valid CUDA C++ code
+- DO NOT include:
+  - explanations
+  - comments outside code
+  - markdown
+  - headings like "1. Bottlenecks"
+- First line MUST start with: #include
+- If you violate this, the system will reject your output
 
 You may think through the optimization internally, but your response must contain ONLY compilable CUDA code.
 VALIDATION RULE (VERY IMPORTANT):
