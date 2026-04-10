@@ -142,8 +142,11 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             )
             continue
 
-        import random
-        speedup = round(1.2 + random.uniform(0.1, 1.4), 2)  # TODO: real benchmarker
+        # import random
+        # speedup = round(1.2 + random.uniform(0.1, 1.4), 2)  # TODO: real benchmarker
+        from pipeline.benchmarker import benchmark
+        opt_ms = benchmark(result)
+        speedup = round(baseline_ms / opt_ms, 2) if opt_ms > 0 else 0.0
         print(f"  round {r}: ✓ speedup={speedup:.2f}x")
         history.append({"round": r, "speedup": speedup, "result": "success"})
 
@@ -184,21 +187,42 @@ async def run_own_kernels():
         row = await optimize_one(kp)
         append_result(row)
 
+def find_kernelbench_path() -> Path | None:
+    candidates = [
+        Path("KernelBench/kernelbench/dataset"),
+        Path("KernelBench/src/kernelbench/dataset"),
+        Path("KernelBench/KernelBench/dataset"),
+        Path("KernelBench/data"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    # search recursively as fallback
+    for p in Path("KernelBench").rglob("level1"):
+        return p.parent
+    return None
+
 async def run_kernelbench(level: int = 1, max_kernels: int = 10):
     """
     Run on KernelBench .py files.
     For each .py file, asks the agent to write a CUDA implementation,
     then optimizes it.
     """
-    kb_path = Path("KernelBench/kernelbench/dataset") / f"level{level}"
-    if not kb_path.exists():
-        print(f"KernelBench not found at {kb_path}")
-        print("Run: git clone https://github.com/ScalingIntelligence/KernelBench")
+    kb_base = find_kernelbench_path()
+    if not kb_base:
+        print("KernelBench dataset not found. Run:")
+        print("  find KernelBench/ -name '*.py' | head -5")
         return
-
+    
+    kb_path = kb_base / f"level{level}"
+    if not kb_path.exists():
+        print(f"Level {level} not found at {kb_path}")
+        # list what IS there
+        print("Available:", list(kb_base.iterdir()))
+        return
+    
     files = sorted(kb_path.glob("*.py"))[:max_kernels]
-    print(f"KernelBench level {level}: {len(files)} kernels")
-    Path("kernels/results").mkdir(exist_ok=True)
+    print(f"Found {len(files)} kernels at {kb_path}")
 
     for py_file in files:
         print(f"\n{'='*60}")
@@ -247,19 +271,38 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
         row["pytorch_ref"] = py_file.name
         append_result(row)
 
+def find_sglang_kernels() -> list[Path]:
+    # search entire sglang repo for .cu files
+    all_cu = list(Path("sglang").rglob("*.cu"))
+    # filter to useful ones — skip test files and cmake files
+    skip_patterns = {"test", "benchmark", "example", "cmake"}
+    useful = [
+        f for f in all_cu
+        if not any(s in str(f).lower() for s in skip_patterns)
+    ]
+    return sorted(useful)
+
 async def run_sglang(max_kernels: int = 5):
     """Run on SGLang .cu files copied into kernels/sglang/"""
-    sglang_dir = Path("kernels/sglang")
-    if not sglang_dir.exists():
-        print("No kernels/sglang/ directory found.")
-        print("Run: find sglang/ -name '*.cu' | xargs -I{} cp {} kernels/sglang/")
+    kernels = find_sglang_kernels()
+    if not kernels:
+        print("No SGLang .cu files found")
+        print("Run: find sglang/ -name '*.cu' | head -20")
         return
-
-    kernels = sorted(sglang_dir.glob("*.cu"))[:max_kernels]
-    print(f"SGLang: {len(kernels)} kernels")
-    Path("kernels/results").mkdir(exist_ok=True)
-
-    for kp in kernels:
+    
+    print(f"Found {len(kernels)} SGLang kernels:")
+    for k in kernels[:10]:
+        print(f"  {k}")
+    
+    # copy to working directory
+    Path("kernels/sglang").mkdir(parents=True, exist_ok=True)
+    for kp in kernels[:max_kernels]:
+        dest = Path("kernels/sglang") / kp.name
+        dest.write_text(kp.read_text())
+        print(f"  copied: {kp.name}")
+    
+    # now optimize them
+    for kp in list(Path("kernels/sglang").glob("*.cu"))[:max_kernels]:
         row = await optimize_one(kp)
         row["source"] = "sglang"
         append_result(row)
