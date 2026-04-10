@@ -27,6 +27,7 @@ logging.basicConfig(level=logging.ERROR)
 DIRECTORY_PATH = Path("kernels")
 
 AGENT_MODEL = "gemini-3.1-flash-lite-preview"
+# AGENT_MODEL = "claude-sonnet-4-6"
 
 PROMPT = f"""
 You are a CUDA optimization expert for RTX A4000 (sm_86).

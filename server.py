@@ -134,16 +134,11 @@ async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
 
     metrics_ctx = ""
     baseline_ms = 1.0  # TODO: replace with real benchmarker.benchmark()
-
-    # if pf.get("status") != "success":
-    #     await send_ws(ws, type="opt_progress",
-    #         text=f"pre-flight failed at {pf.get('stage')}: {pf.get('result', pf.get('error_message'))}",
-    #         cls="fail")
     
     if pf.get("status") != "success":
         print("PREFLIGHT ERROR:", pf)
         await send_ws(ws, type="opt_progress",
-            text="⚠️ Pre-flight failed — optimization may be unstable", cls="fail")
+            text="Pre-flight failed — optimization may be unstable", cls="fail")
 
     if pf.get("status") == "success":
         m = pf["metrics"]
@@ -262,7 +257,7 @@ async def run_optimization(ws: WebSocket, kernel_path: str, rounds: int = 5):
             f"{history_ctx}"
             f"{best_ctx}\n"
             f"STRICT OUTPUT RULES — MUST FOLLOW:"
-
+            f"Also the kernels can be in pytorch extension so extract them from it also"
             f"- Output ONLY raw CUDA code"
             f"""- DO NOT include:
             - explanations
