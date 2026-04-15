@@ -26,7 +26,8 @@ logging.basicConfig(level=logging.ERROR)
 
 DIRECTORY_PATH = Path("kernels")
 
-AGENT_MODEL = "gemini-3.1-flash-lite-preview"
+# AGENT_MODEL = "gemini-3.1-flash-lite-preview"
+AGENT_MODEL = "gemini-3-flash-preview"
 # AGENT_MODEL = "claude-sonnet-4-6"
 
 PROMPT = f"""

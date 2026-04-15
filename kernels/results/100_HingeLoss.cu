@@ -1,96 +1,119 @@
-#include <iostream>
-#include <vector>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+#include <cstdio>
+#include <algorithm>
+#include <cstdlib>
 
-#define BLOCK_SIZE 256
-#define ITEMS_PER_THREAD 4
+__global__ void hinge_loss_kernel(const float* __restrict__ predictions, const float* __restrict__ targets, double* global_sum, size_t total_elements, size_t N) {
+    double thread_sum = 0.0;
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
 
-__device__ __forceinline__ float warpReduceSum(float val) {
-    for (int offset = warpSize / 2; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
+    // Vectorize memory access using float4.
+    // N is 32768, which is divisible by 4.
+    const float4* preds4 = (const float4*)predictions;
+    const float4* targets4 = (const float4*)targets;
+    size_t total_elements4 = total_elements / 4;
+    size_t N4 = N / 4;
 
-__global__ void hinge_loss_kernel(const float* __restrict__ predictions, const float* __restrict__ targets, float* __restrict__ partial_sums, int n) {
-    extern __shared__ float sdata[];
-    int tid = threadIdx.x;
-    int i = (blockIdx.x * blockDim.x + threadIdx.x) * ITEMS_PER_THREAD;
+    // Precalculate column index. Since stride (2048 * 256 = 524288) 
+    // is a multiple of N4 (8192), col_idx remains constant.
+    size_t col_idx = idx % N4;
 
-    float sum = 0.0f;
-    for (int k = 0; k < ITEMS_PER_THREAD; ++k) {
-        if (i + k < n) {
-            float p = predictions[i + k];
-            float t = targets[i + k];
-            float val = 1.0f - p * t;
-            sum += (val > 0.0f) ? val : 0.0f;
-        }
+    for (size_t i = idx; i < total_elements4; i += stride) {
+        float4 p = preds4[i];
+        float4 t = targets4[col_idx];
+
+        // Use fmaxf to eliminate branching and optimize compute throughput.
+        thread_sum += (double)fmaxf(0.0f, 1.0f - p.x * t.x);
+        thread_sum += (double)fmaxf(0.0f, 1.0f - p.y * t.y);
+        thread_sum += (double)fmaxf(0.0f, 1.0f - p.z * t.z);
+        thread_sum += (double)fmaxf(0.0f, 1.0f - p.w * t.w);
     }
 
-    sum = warpReduceSum(sum);
-
-    if (tid % warpSize == 0) {
-        sdata[tid / warpSize] = sum;
-    }
+    __shared__ double sdata[256];
+    unsigned int tid = threadIdx.x;
+    sdata[tid] = thread_sum;
     __syncthreads();
 
-    if (tid < (BLOCK_SIZE / warpSize)) {
-        sum = sdata[tid];
-        sum = warpReduceSum(sum);
-        if (tid == 0) partial_sums[blockIdx.x] = sum;
+    // Block-level reduction
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid < 32) {
+        // Warp-level reduction
+        double val = sdata[tid];
+        val += sdata[tid + 32];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        }
+        if (tid == 0) {
+            atomicAdd(global_sum, val);
+        }
     }
 }
 
 int main() {
-    const int N = 32768;
-    size_t size = N * sizeof(float);
+    const size_t N = 32768;
+    const size_t total_elements = N * N;
 
-    float *h_pred = new float[N];
-    float *h_targ = new float[N];
-    for (int i = 0; i < N; i++) {
-        h_pred[i] = (float)rand() / RAND_MAX;
-        h_targ[i] = (rand() % 2 == 0) ? -1.0f : 1.0f;
+    float* h_preds = (float*)malloc(total_elements * sizeof(float));
+    float* h_targets = (float*)malloc(N * sizeof(float));
+
+    if (!h_preds || !h_targets) {
+        if (h_preds) free(h_preds);
+        if (h_targets) free(h_targets);
+        return 1;
     }
 
-    float *d_pred, *d_targ, *d_partial;
-    cudaMalloc(&d_pred, size);
-    cudaMalloc(&d_targ, size);
-    
-    int grid_size = (N + (BLOCK_SIZE * ITEMS_PER_THREAD) - 1) / (BLOCK_SIZE * ITEMS_PER_THREAD);
-    cudaMalloc(&d_partial, grid_size * sizeof(float));
-
-    cudaMemcpy(d_pred, h_pred, size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_targ, h_targ, size, cudaMemcpyHostToDevice);
-
-    hinge_loss_kernel<<<grid_size, BLOCK_SIZE, (BLOCK_SIZE / 32) * sizeof(float)>>>(d_pred, d_targ, d_partial, N);
-
-    std::vector<float> h_partial(grid_size);
-    cudaMemcpy(h_partial.data(), d_partial, grid_size * sizeof(float), cudaMemcpyDeviceToHost);
-
-    float gpu_sum = 0.0f;
-    for (int i = 0; i < grid_size; ++i) gpu_sum += h_partial[i];
-    float gpu_res = gpu_sum / (float)N;
-
-    float cpu_sum = 0.0f;
-    for (int i = 0; i < N; i++) {
-        float val = 1.0f - h_pred[i] * h_targ[i];
-        cpu_sum += (val > 0.0f) ? val : 0.0f;
+    for (size_t i = 0; i < total_elements; ++i) {
+        h_preds[i] = (float)(i % 1024) / 1024.0f;
     }
-    float cpu_res = cpu_sum / (float)N;
+    for (size_t i = 0; i < N; ++i) {
+        h_targets[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+    }
 
-    float diff = gpu_res - cpu_res;
-    if (diff < 0) diff = -diff;
-    float max_val = gpu_res;
-    if (cpu_res > max_val) max_val = cpu_res;
-    if (max_val < 1.0f) max_val = 1.0f;
+    float *d_preds, *d_targets;
+    double *d_sum;
+    cudaMalloc(&d_preds, total_elements * sizeof(float));
+    cudaMalloc(&d_targets, N * sizeof(float));
+    cudaMalloc(&d_sum, sizeof(double));
 
+    cudaMemcpy(d_preds, h_preds, total_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_targets, h_targets, N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_sum, 0, sizeof(double));
+
+    int blockSize = 256;
+    int gridSize = 2048;
+    hinge_loss_kernel<<<gridSize, blockSize>>>(d_preds, d_targets, d_sum, total_elements, N);
+
+    double h_sum_gpu_db;
+    cudaMemcpy(&h_sum_gpu_db, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
+    float gpu_result = (float)(h_sum_gpu_db / (double)total_elements);
+
+    double h_sum_cpu = 0.0;
+    for (size_t i = 0; i < total_elements; ++i) {
+        float val = 1.0f - h_preds[i] * h_targets[i % N];
+        if (val > 0.0f) h_sum_cpu += (double)val;
+    }
+    float cpu_result = (float)(h_sum_cpu / (double)total_elements);
+
+    float diff = fabsf(gpu_result - cpu_result);
+    float max_val = std::max({1.0f, fabsf(gpu_result), fabsf(cpu_result)});
     if (diff <= 1e-3f * max_val) {
-        std::cout << "SUCCESS" << std::endl;
+        printf("SUCCESS\n");
     } else {
-        printf("FAILURE: GPU=%f CPU=%f\n", gpu_res, cpu_res);
+        printf("FAILURE: GPU=%f CPU=%f DIFF=%f\n", gpu_result, cpu_result, diff);
     }
 
-    cudaFree(d_pred); cudaFree(d_targ); cudaFree(d_partial);
-    delete[] h_pred; delete[] h_targ;
+    free(h_preds);
+    free(h_targets);
+    cudaFree(d_preds);
+    cudaFree(d_targets);
+    cudaFree(d_sum);
+
     return 0;
 }

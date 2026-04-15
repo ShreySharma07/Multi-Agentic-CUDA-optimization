@@ -10,6 +10,7 @@ from pipeline.compiler import compile_cuda
 from pipeline.pre_flight import pre_flight
 from pipeline.validator import run_validation
 from Agents.coder import safe_chat, runner, USER_ID, SESSION_ID
+from pipeline.benchmarker import benchmark
 
 RESULTS_CSV = "results/experiments.csv"
 ROUNDS = 5
@@ -120,6 +121,10 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         print(f"  round {r}: compiling...")
         ok, result = compile_cuda(str(tmp))
 
+        baseline_binary = result  # the compiled baseline binary
+        baseline_ms = benchmark(baseline_binary)
+        print(f"  baseline: {baseline_ms:.3f}ms")
+
         if not ok:
             err = str(result)[:400]
             print(f"  round {r}: COMPILE FAILED — {err[:80]}")
@@ -144,7 +149,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
 
         # import random
         # speedup = round(1.2 + random.uniform(0.1, 1.4), 2)  # TODO: real benchmarker
-        from pipeline.benchmarker import benchmark
+        
         opt_ms = benchmark(result)
         speedup = round(baseline_ms / opt_ms, 2) if opt_ms > 0 else 0.0
         print(f"  round {r}: ✓ speedup={speedup:.2f}x")

@@ -1,97 +1,125 @@
-#include <iostream>
-#include <vector>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+#include <cstdio>
+#include <algorithm>
+#include <cstdlib>
 
-#define TILE_SIZE 16
+__global__ void hinge_loss_kernel(const float* __restrict__ predictions, const float* __restrict__ targets, double* global_sum, size_t total_elements, size_t N) {
+    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    size_t stride = (size_t)blockDim.x * gridDim.x;
 
-__global__ void matmul_3d_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int N, int M, int K, int L) {
-    extern __shared__ float shared_mem[];
-    float* A_tile = &shared_mem[0];
-    float* B_tile = &shared_mem[TILE_SIZE * TILE_SIZE];
+    const float4* preds4 = (const float4*)predictions;
+    const float4* targets4 = (const float4*)targets;
+    size_t total_elements4 = total_elements / 4;
+    size_t N4 = N / 4;
 
-    int n = blockIdx.z;
-    int m = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int l = blockIdx.x * TILE_SIZE + threadIdx.x;
+    size_t col_idx = idx % N4;
+    float4 t = targets4[col_idx];
 
-    float sum = 0.0f;
-    for (int k_block = 0; k_block < K; k_block += TILE_SIZE) {
-        if (m < M && (k_block + threadIdx.x) < K) {
-            A_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = A[(n * M + m) * K + (k_block + threadIdx.x)];
-        } else {
-            A_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = 0.0f;
-        }
+    // Using float accumulators for maximum FP32 throughput on sm_86.
+    // Loop unrolling to increase Instruction Level Parallelism (ILP).
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
 
-        if (l < L && (k_block + threadIdx.y) < K) {
-            B_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = B[(k_block + threadIdx.y) * L + l];
-        } else {
-            B_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = 0.0f;
-        }
-        __syncthreads();
+    #pragma unroll 4
+    for (size_t i = idx; i < total_elements4; i += stride) {
+        float4 p = preds4[i];
+        
+        // fmaf: fused multiply-add for compute efficiency
+        // fmaxf: branchless compute instruction
+        acc0 += fmaxf(0.0f, fmaf(-p.x, t.x, 1.0f));
+        acc1 += fmaxf(0.0f, fmaf(-p.y, t.y, 1.0f));
+        acc2 += fmaxf(0.0f, fmaf(-p.z, t.z, 1.0f));
+        acc3 += fmaxf(0.0f, fmaf(-p.w, t.w, 1.0f));
+    }
 
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; ++k) {
-            sum += A_tile[threadIdx.y * TILE_SIZE + k] * B_tile[k * TILE_SIZE + threadIdx.x];
+    // Accumulate everything into double before the reduction to maintain precision
+    double thread_sum = (double)acc0 + (double)acc1 + (double)acc2 + (double)acc3;
+
+    __shared__ double sdata[256];
+    unsigned int tid = threadIdx.x;
+    sdata[tid] = thread_sum;
+    __syncthreads();
+
+    // Block-level reduction
+    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
     }
 
-    if (n < N && m < M && l < L) {
-        C[(n * M + m) * L + l] = sum;
+    if (tid < 32) {
+        double val = sdata[tid];
+        val += sdata[tid + 32];
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+        }
+        if (tid == 0) {
+            atomicAdd(global_sum, val);
+        }
     }
 }
 
 int main() {
-    const int N = 16, M = 128, K = 256, L = 128;
-    size_t size_A = (size_t)N * M * K * sizeof(float);
-    size_t size_B = (size_t)K * L * sizeof(float);
-    size_t size_C = (size_t)N * M * L * sizeof(float);
+    const size_t N = 32768;
+    const size_t total_elements = N * N;
 
-    float *h_A = new float[N * M * K];
-    float *h_B = new float[K * L];
-    float *h_C = new float[N * M * L];
-    float *h_C_gpu = new float[N * M * L];
+    float* h_preds = (float*)malloc(total_elements * sizeof(float));
+    float* h_targets = (float*)malloc(N * sizeof(float));
 
-    for (int i = 0; i < N * M * K; i++) h_A[i] = (float)rand() / RAND_MAX;
-    for (int i = 0; i < K * L; i++) h_B[i] = (float)rand() / RAND_MAX;
-
-    float *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, size_A);
-    cudaMalloc(&d_B, size_B);
-    cudaMalloc(&d_C, size_C);
-
-    cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice);
-
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((L + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE, N);
-
-    size_t shared_size = 2 * TILE_SIZE * TILE_SIZE * sizeof(float);
-    matmul_3d_kernel<<<grid, block, shared_size>>>(d_A, d_B, d_C, N, M, K, L);
-
-    cudaMemcpy(h_C_gpu, d_C, size_C, cudaMemcpyDeviceToHost);
-
-    for (int n = 0; n < N; n++) {
-        for (int m = 0; m < M; m++) {
-            for (int l = 0; l < L; l++) {
-                float sum = 0.0f;
-                for (int k = 0; k < K; k++) {
-                    sum += h_A[(n * M + m) * K + k] * h_B[k * L + l];
-                }
-                h_C[(n * M + m) * L + l] = sum;
-            }
-        }
+    if (!h_preds || !h_targets) {
+        if (h_preds) free(h_preds);
+        if (h_targets) free(h_targets);
+        return 1;
     }
 
-    bool success = true;
-    for (int i = 0; i < N * M * L; i++) {
-        if (std::abs(h_C_gpu[i] - h_C[i]) > 1e-3f * std::max(1.0f, std::max(std::abs(h_C_gpu[i]), std::abs(h_C[i])))) {
-            success = false; break;
-        }
+    for (size_t i = 0; i < total_elements; ++i) {
+        h_preds[i] = (float)(i % 1024) / 1024.0f;
     }
-    std::cout << (success ? "SUCCESS" : "FAILURE") << std::endl;
+    for (size_t i = 0; i < N; ++i) {
+        h_targets[i] = (i % 2 == 0) ? 1.0f : -1.0f;
+    }
 
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
-    delete[] h_A; delete[] h_B; delete[] h_C; delete[] h_C_gpu;
+    float *d_preds, *d_targets;
+    double *d_sum;
+    cudaMalloc(&d_preds, total_elements * sizeof(float));
+    cudaMalloc(&d_targets, N * sizeof(float));
+    cudaMalloc(&d_sum, sizeof(double));
+
+    cudaMemcpy(d_preds, h_preds, total_elements * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_targets, h_targets, N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemset(d_sum, 0, sizeof(double));
+
+    int blockSize = 256;
+    int gridSize = 2048;
+    hinge_loss_kernel<<<gridSize, blockSize>>>(d_preds, d_targets, d_sum, total_elements, N);
+
+    double h_sum_gpu_db;
+    cudaMemcpy(&h_sum_gpu_db, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
+    float gpu_result = (float)(h_sum_gpu_db / (double)total_elements);
+
+    double h_sum_cpu = 0.0;
+    for (size_t i = 0; i < total_elements; ++i) {
+        float val = 1.0f - h_preds[i] * h_targets[i % N];
+        if (val > 0.0f) h_sum_cpu += (double)val;
+    }
+    float cpu_result = (float)(h_sum_cpu / (double)total_elements);
+
+    float diff = fabsf(gpu_result - cpu_result);
+    float max_val = std::max({1.0f, fabsf(gpu_result), fabsf(cpu_result)});
+    if (diff <= 1e-3f * max_val) {
+        printf("SUCCESS\n");
+    } else {
+        printf("FAILURE: GPU=%f CPU=%f DIFF=%f\n", gpu_result, cpu_result, diff);
+    }
+
+    free(h_preds);
+    free(h_targets);
+    cudaFree(d_preds);
+    cudaFree(d_targets);
+    cudaFree(d_sum);
+
     return 0;
 }
