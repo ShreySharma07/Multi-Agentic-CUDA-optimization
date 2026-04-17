@@ -2,3 +2,10 @@ timestamp,kernel,source,rounds,best_speedup,best_round,compile_failures,validati
 2026-04-10T14:48:58.972327,kernel.cu,kernels/kernel.cu,5,2.11,1,0,0,unknown
 2026-04-10T14:57:21.549147,100_HingeLoss.cu,kernelbench_l1,5,2.37,4,1,0,compute-bound,100_HingeLoss.py
 2026-04-10T14:58:29.332300,10_3D_tensor_matrix_multiplication.cu,kernelbench_l1,5,2.41,5,0,1,compute-bound,10_3D_tensor_matrix_multiplication.py
+2026-04-17T13:44:09.563441,100_HingeLoss.cu,kernelbench_l1,5,0.92,3,0,0,compute-bound,100_HingeLoss.py
+2026-04-17T13:49:22.048165,10_3D_tensor_matrix_multiplication.cu,kernelbench_l1,5,0.0,0,0,5,compute-bound,10_3D_tensor_matrix_multiplication.py
+2026-04-17T13:53:04.383413,12_Matmul_with_diagonal_matrices_.cu,kernelbench_l1,5,1.19,4,0,0,memory-bound,12_Matmul_with_diagonal_matrices_.py
+2026-04-17T13:57:12.946751,100_HingeLoss.cu,kernelbench_l1,5,0.91,5,1,0,compute-bound,100_HingeLoss.py
+2026-04-17T14:36:14.939049,rasterizer_gpu.cu,sglang,5,6.16,5,0,0,unknown
+2026-04-17T14:37:14.504571,moe_lora_align_kernel.cu,sglang,5,12.79,3,0,0,unknown
+2026-04-17T14:38:18.543657,moe_align_kernel.cu,sglang,5,2.1,1,0,0,unknown

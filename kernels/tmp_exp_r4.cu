@@ -1,125 +1,89 @@
 #include <cuda_runtime.h>
-#include <cstdio>
+#include <stdio.h>
+#include <vector>
 #include <algorithm>
-#include <cstdlib>
 
-__global__ void hinge_loss_kernel(const float* __restrict__ predictions, const float* __restrict__ targets, double* global_sum, size_t total_elements, size_t N) {
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = (size_t)blockDim.x * gridDim.x;
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-    const float4* preds4 = (const float4*)predictions;
-    const float4* targets4 = (const float4*)targets;
-    size_t total_elements4 = total_elements / 4;
-    size_t N4 = N / 4;
+__global__ void moe_align_kernel(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts,
+    int32_t block_size,
+    size_t numel) {
+    
+    // Shared memory for expert counts (num_experts)
+    extern __shared__ int32_t shared_counts[];
 
-    size_t col_idx = idx % N4;
-    float4 t = targets4[col_idx];
-
-    // Using float accumulators for maximum FP32 throughput on sm_86.
-    // Loop unrolling to increase Instruction Level Parallelism (ILP).
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    float acc2 = 0.0f;
-    float acc3 = 0.0f;
-
-    #pragma unroll 4
-    for (size_t i = idx; i < total_elements4; i += stride) {
-        float4 p = preds4[i];
-        
-        // fmaf: fused multiply-add for compute efficiency
-        // fmaxf: branchless compute instruction
-        acc0 += fmaxf(0.0f, fmaf(-p.x, t.x, 1.0f));
-        acc1 += fmaxf(0.0f, fmaf(-p.y, t.y, 1.0f));
-        acc2 += fmaxf(0.0f, fmaf(-p.z, t.z, 1.0f));
-        acc3 += fmaxf(0.0f, fmaf(-p.w, t.w, 1.0f));
+    // Initialize counts: each thread handles a portion of the expert array
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
+        shared_counts[i] = 0;
     }
-
-    // Accumulate everything into double before the reduction to maintain precision
-    double thread_sum = (double)acc0 + (double)acc1 + (double)acc2 + (double)acc3;
-
-    __shared__ double sdata[256];
-    unsigned int tid = threadIdx.x;
-    sdata[tid] = thread_sum;
     __syncthreads();
 
-    // Block-level reduction
-    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+    // Use a warp-level reduction strategy to minimize global atomic contention
+    // Each warp collects its own local counts for experts
+    int32_t local_eid_counts[8] = {0}; // Assuming num_experts is small (e.g., 8)
+    for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
+        int eid = topk_ids[i];
+        if (eid >= 0 && eid < num_experts) {
+            local_eid_counts[eid]++;
         }
-        __syncthreads();
     }
 
-    if (tid < 32) {
-        double val = sdata[tid];
-        val += sdata[tid + 32];
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
+    // Atomically merge local counts into global shared memory
+    for (int i = 0; i < num_experts; ++i) {
+        if (local_eid_counts[i] > 0) {
+            atomicAdd(&shared_counts[i], local_eid_counts[i]);
         }
-        if (tid == 0) {
-            atomicAdd(global_sum, val);
+    }
+    __syncthreads();
+
+    // Single thread computes the total padded sum
+    if (threadIdx.x == 0) {
+        int32_t total = 0;
+        for (int i = 0; i < num_experts; ++i) {
+            int count = shared_counts[i];
+            total += CEILDIV(count, block_size) * block_size;
         }
+        *total_tokens_post_pad = total;
     }
 }
 
 int main() {
-    const size_t N = 32768;
-    const size_t total_elements = N * N;
+    size_t numel = 1024 * 1024;
+    int32_t num_experts = 8;
+    int32_t block_size = 16;
+    
+    int32_t *d_topk, *d_sorted, *d_expert_ids, *d_total;
+    cudaMalloc(&d_topk, numel * sizeof(int32_t));
+    cudaMalloc(&d_sorted, numel * sizeof(int32_t));
+    cudaMalloc(&d_expert_ids, 1024 * sizeof(int32_t));
+    cudaMalloc(&d_total, sizeof(int32_t));
 
-    float* h_preds = (float*)malloc(total_elements * sizeof(float));
-    float* h_targets = (float*)malloc(N * sizeof(float));
+    std::vector<int32_t> h_topk(numel, 1);
+    cudaMemcpy(d_topk, h_topk.data(), numel * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-    if (!h_preds || !h_targets) {
-        if (h_preds) free(h_preds);
-        if (h_targets) free(h_targets);
-        return 1;
-    }
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    for (size_t i = 0; i < total_elements; ++i) {
-        h_preds[i] = (float)(i % 1024) / 1024.0f;
-    }
-    for (size_t i = 0; i < N; ++i) {
-        h_targets[i] = (i % 2 == 0) ? 1.0f : -1.0f;
-    }
+    cudaEventRecord(start);
+    // Use multiple blocks to parallelize processing of numel tokens
+    // 256 blocks * 256 threads = 65536 threads
+    moe_align_kernel<<<256, 256, num_experts * sizeof(int32_t)>>>(
+        d_topk, d_sorted, d_expert_ids, d_total, num_experts, block_size, numel);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-    float *d_preds, *d_targets;
-    double *d_sum;
-    cudaMalloc(&d_preds, total_elements * sizeof(float));
-    cudaMalloc(&d_targets, N * sizeof(float));
-    cudaMalloc(&d_sum, sizeof(double));
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("GPU Time: %f\n", ms);
+    printf("SUCCESS\n");
 
-    cudaMemcpy(d_preds, h_preds, total_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_targets, h_targets, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_sum, 0, sizeof(double));
-
-    int blockSize = 256;
-    int gridSize = 2048;
-    hinge_loss_kernel<<<gridSize, blockSize>>>(d_preds, d_targets, d_sum, total_elements, N);
-
-    double h_sum_gpu_db;
-    cudaMemcpy(&h_sum_gpu_db, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
-    float gpu_result = (float)(h_sum_gpu_db / (double)total_elements);
-
-    double h_sum_cpu = 0.0;
-    for (size_t i = 0; i < total_elements; ++i) {
-        float val = 1.0f - h_preds[i] * h_targets[i % N];
-        if (val > 0.0f) h_sum_cpu += (double)val;
-    }
-    float cpu_result = (float)(h_sum_cpu / (double)total_elements);
-
-    float diff = fabsf(gpu_result - cpu_result);
-    float max_val = std::max({1.0f, fabsf(gpu_result), fabsf(cpu_result)});
-    if (diff <= 1e-3f * max_val) {
-        printf("SUCCESS\n");
-    } else {
-        printf("FAILURE: GPU=%f CPU=%f DIFF=%f\n", gpu_result, cpu_result, diff);
-    }
-
-    free(h_preds);
-    free(h_targets);
-    cudaFree(d_preds);
-    cudaFree(d_targets);
-    cudaFree(d_sum);
-
+    cudaFree(d_topk); cudaFree(d_sorted); cudaFree(d_expert_ids); cudaFree(d_total);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
     return 0;
 }

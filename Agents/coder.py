@@ -26,50 +26,39 @@ logging.basicConfig(level=logging.ERROR)
 
 DIRECTORY_PATH = Path("kernels")
 
-# AGENT_MODEL = "gemini-3.1-flash-lite-preview"
-AGENT_MODEL = "gemini-3-flash-preview"
+AGENT_MODEL = "gemini-3.1-flash-lite-preview"
+# AGENT_MODEL = "gemini-3-flash-preview"
 # AGENT_MODEL = "claude-sonnet-4-6"
+# AGENT_MODEL = "gemini-2.5-flash"
 
 PROMPT = f"""
 You are a CUDA optimization expert for RTX A4000 (sm_86).
 
-
 CUDA files are located in:
 {DIRECTORY_PATH}
 
-
 IMPORTANT RULES:
-
 - Always output the FULL optimized CUDA kernel.
 - The optimized kernel must be complete and compilable.
-- Include the entire kernel code, not just a snippet.
-- Wrap the final optimized kernel inside a ```cpp code block.
-- Do not stop after explaining optimizations.
 
-Final output format:
 STRICT OUTPUT RULES — MUST FOLLOW:
-
-- Output ONLY valid CUDA C++ code
+- Output ONLY valid CUDA C++ code.
 - DO NOT include:
   - explanations
   - comments outside code
-  - markdown
+  - markdown or code blocks (no ```cpp)
   - headings like "1. Bottlenecks"
-- First line MUST start with: #include
-- If you violate this, the system will reject your output
+- First line MUST start directly with: #include
+- If you violate this, the system will reject your output.
 
-You may think through the optimization internally, but your response must contain ONLY compilable CUDA code.
 VALIDATION RULE (VERY IMPORTANT):
-
-- When comparing GPU vs CPU results:
-    Use tolerance-based comparison:
-    
-    abs(gpu - cpu) <= 1e-3 * max(1.0, abs(gpu), abs(cpu))
-
-- DO NOT use strict equality
-- DO NOT use very small tolerance like 1e-6
-- Print "SUCCESS" only if all values satisfy tolerance
-- Otherwise print "FAILURE" printf("ERROR at index %d: GPU=%f CPU=%f DIFF=%f\n", i, gpu, cpu, fabs(gpu-cpu));
+- You must include a main() function that validates the GPU output against a CPU reference.
+- Use tolerance-based comparison: abs(gpu - cpu) <= 1e-3 * max(1.0, abs(gpu), abs(cpu))
+- At the very end of main(), you MUST print exactly two lines in this exact format:
+  1. If math is correct: printf("SUCCESS\\n");
+     If math is wrong: printf("FAILURE\\n");
+  2. printf("GPU Time: %f\\n", milliseconds);
+- DO NOT print the word "milliseconds" in the output string, just the number.
 """
 
 agent = Agent(
@@ -162,25 +151,55 @@ async def chat(query: str, runner, user_id, session_id):
 
 import asyncio
 
+# async def safe_chat(prompt, runner, user_id, session_id):
+#     max_retries = 5
+    
+#     for attempt in range(max_retries):
+#         try:
+#             return await chat(prompt, runner, user_id, session_id)
+        
+#         except Exception as e:
+#             error_str = str(e)
+            
+#             if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
+#                 wait_time = 50  # or parse from error
+                
+#                 print(f"[RATE LIMIT] Waiting {wait_time}s before retry...")
+#                 await asyncio.sleep(wait_time)
+#             else:
+#                 raise e
+    
+#     return "Agent failed due to repeated rate limits."
+
+import asyncio
+import random
+
 async def safe_chat(prompt, runner, user_id, session_id):
-    max_retries = 5
+    max_retries = 7
+    base_wait_time = 5  # start with a 5 second wait
     
     for attempt in range(max_retries):
         try:
             return await chat(prompt, runner, user_id, session_id)
         
         except Exception as e:
-            error_str = str(e)
+            error_str = str(e).upper()
             
-            if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                wait_time = 50  # or parse from error
+            # Catch both Rate Limits (429) AND Server Overloads (503/500/502)
+            if any(code in error_str for code in ["429", "503", "500", "502", "RESOURCE_EXHAUSTED", "UNAVAILABLE"]):
+                # Exponential backoff with jitter to avoid slamming the server
+                wait_time = (base_wait_time ** attempt) + random.uniform(0, 3)
                 
-                print(f"[RATE LIMIT] Waiting {wait_time}s before retry...")
+                # Cap the maximum wait time to 60 seconds
+                wait_time = min(wait_time, 60.0) 
+                
+                print(f"  [API Error] {error_str[:60]}... Waiting {wait_time:.1f}s before retry ({attempt + 1}/{max_retries})...")
                 await asyncio.sleep(wait_time)
             else:
+                # If it's a completely different error (like a syntax error in the code), crash normally
                 raise e
     
-    return "Agent failed due to repeated rate limits."
+    return "Agent failed due to repeated API errors."
 
 async def main():
     await init_session(APP_NAME, USER_ID, SESSION_ID)

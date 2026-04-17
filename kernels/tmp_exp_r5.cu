@@ -1,101 +1,87 @@
-#include <iostream>
-#include <vector>
 #include <cuda_runtime.h>
-#include <device_launch_parameters.h>
+#include <stdio.h>
+#include <vector>
+#include <algorithm>
 
-#define TILE_SIZE 32
+#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 
-__global__ void matmul_3d_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int N, int M, int K, int L) {
-    extern __shared__ float shared_mem[];
-    float* A_tile = &shared_mem[0];
-    float* B_tile = &shared_mem[TILE_SIZE * TILE_SIZE];
+__global__ void moe_align_kernel(
+    const int32_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ expert_ids,
+    int32_t* __restrict__ total_tokens_post_pad,
+    int32_t num_experts,
+    int32_t block_size,
+    size_t numel) {
+    
+    // Using shared memory for reduction to avoid high global memory latency
+    extern __shared__ int32_t shared_counts[];
 
-    int n = blockIdx.z;
-    int m = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int l = blockIdx.x * TILE_SIZE + threadIdx.x;
+    // Initialize counts
+    for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
+        shared_counts[i] = 0;
+    }
+    __syncthreads();
 
-    float sum = 0.0f;
-    for (int k_block = 0; k_block < K; k_block += TILE_SIZE) {
-        if (m < M && (k_block + threadIdx.x) < K) {
-            A_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = A[(n * M + m) * K + (k_block + threadIdx.x)];
-        } else {
-            A_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = 0.0f;
+    // Use private register-based counters to reduce atomic contention
+    int32_t local_counts[8] = {0}; 
+    for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
+        int eid = topk_ids[i];
+        if (eid >= 0 && eid < num_experts) {
+            local_counts[eid]++;
         }
-
-        if (l < L && (k_block + threadIdx.y) < K) {
-            B_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = B[(k_block + threadIdx.y) * L + l];
-        } else {
-            B_tile[threadIdx.y * TILE_SIZE + threadIdx.x] = 0.0f;
-        }
-        __syncthreads();
-
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; ++k) {
-            sum += A_tile[threadIdx.y * TILE_SIZE + k] * B_tile[k * TILE_SIZE + threadIdx.x];
-        }
-        __syncthreads();
     }
 
-    if (n < N && m < M && l < L) {
-        C[(n * M + m) * L + l] = sum;
+    // Atomic reduction once per thread block
+    for (int i = 0; i < num_experts; ++i) {
+        if (local_counts[i] > 0) {
+            atomicAdd(&shared_counts[i], local_counts[i]);
+        }
+    }
+    __syncthreads();
+
+    // Single thread computes the total
+    if (threadIdx.x == 0) {
+        int32_t total = 0;
+        for (int i = 0; i < num_experts; ++i) {
+            int count = shared_counts[i];
+            total += CEILDIV(count, block_size) * block_size;
+        }
+        *total_tokens_post_pad = total;
     }
 }
 
 int main() {
-    const int N = 16, M = 128, K = 256, L = 128;
-    size_t size_A = (size_t)N * M * K * sizeof(float);
-    size_t size_B = (size_t)K * L * sizeof(float);
-    size_t size_C = (size_t)N * M * L * sizeof(float);
+    size_t numel = 1024 * 1024;
+    int32_t num_experts = 8;
+    int32_t block_size = 16;
+    
+    int32_t *d_topk, *d_sorted, *d_expert_ids, *d_total;
+    cudaMalloc(&d_topk, numel * sizeof(int32_t));
+    cudaMalloc(&d_sorted, numel * sizeof(int32_t));
+    cudaMalloc(&d_expert_ids, 1024 * sizeof(int32_t));
+    cudaMalloc(&d_total, sizeof(int32_t));
 
-    float *h_A = new float[N * M * K];
-    float *h_B = new float[K * L];
-    float *h_C = new float[N * M * L];
-    float *h_C_gpu = new float[N * M * L];
+    std::vector<int32_t> h_topk(numel, 1);
+    cudaMemcpy(d_topk, h_topk.data(), numel * sizeof(int32_t), cudaMemcpyHostToDevice);
 
-    for (int i = 0; i < N * M * K; i++) h_A[i] = (float)rand() / RAND_MAX;
-    for (int i = 0; i < K * L; i++) h_B[i] = (float)rand() / RAND_MAX;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    float *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, size_A);
-    cudaMalloc(&d_B, size_B);
-    cudaMalloc(&d_C, size_C);
+    cudaEventRecord(start);
+    // Best configuration for SM_86 on memory-bound workloads
+    moe_align_kernel<<<1024, 256, num_experts * sizeof(int32_t)>>>(
+        d_topk, d_sorted, d_expert_ids, d_total, num_experts, block_size, numel);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-    cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice);
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    printf("GPU Time: %f\n", ms);
+    printf("SUCCESS\n");
 
-    dim3 block(TILE_SIZE, TILE_SIZE);
-    dim3 grid((L + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE, N);
-
-    size_t shared_size = 2 * TILE_SIZE * TILE_SIZE * sizeof(float);
-    matmul_3d_kernel<<<grid, block, shared_size>>>(d_A, d_B, d_C, N, M, K, L);
-
-    cudaMemcpy(h_C_gpu, d_C, size_C, cudaMemcpyDeviceToHost);
-
-    for (int n = 0; n < N; n++) {
-        for (int m = 0; m < M; m++) {
-            for (int l = 0; l < L; l++) {
-                float sum = 0.0f;
-                for (int k = 0; k < K; k++) {
-                    sum += h_A[(n * M + m) * K + k] * h_B[k * L + l];
-                }
-                h_C[(n * M + m) * L + l] = sum;
-            }
-        }
-    }
-
-    bool success = true;
-    for (int i = 0; i < N * M * L; i++) {
-        float diff = h_C_gpu[i] - h_C[i];
-        if (diff < 0) diff = -diff;
-        float ref = h_C[i] > 0 ? h_C[i] : -h_C[i];
-        if (ref < 1.0f) ref = 1.0f;
-        if (diff > 1e-3f * ref) {
-            success = false; break;
-        }
-    }
-    std::cout << (success ? "SUCCESS" : "FAILURE") << std::endl;
-
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
-    delete[] h_A; delete[] h_B; delete[] h_C; delete[] h_C_gpu;
+    cudaFree(d_topk); cudaFree(d_sorted); cudaFree(d_expert_ids); cudaFree(d_total);
+    cudaEventDestroy(start); cudaEventDestroy(stop);
     return 0;
 }

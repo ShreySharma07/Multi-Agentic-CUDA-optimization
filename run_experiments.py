@@ -70,7 +70,9 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
     else:
         print("  pre-flight unavailable — continuing without metrics")
 
-    baseline_ms = 1.0  # TODO: real benchmarker
+    baseline_ok, baseline_bin = compile_cuda(str(kernel_path))  
+    baseline_ms = benchmark(baseline_bin) if baseline_ok else 1.0
+    print(f"  baseline: {baseline_ms:.3f}ms")
     best_speedup = None
     best_round = None
     best_code = source
@@ -100,6 +102,8 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             f"- No cuda/cmath or std::complex headers.\n"
             f"- Apply ONE optimization at a time.\n\n"
             f"OUTPUT RULES:\n"
+            f"- You MUST use cudaEventRecord to measure kernel execution time.\n"
+            f"- You MUST print the execution time to stdout exactly in this format: 'GPU Time: <milliseconds>'\n"
             f"- Start immediately with #include\n"
             f"- No markdown, no explanation, no backticks\n"
             f"- Complete compilable .cu file only\n"
@@ -121,10 +125,6 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         print(f"  round {r}: compiling...")
         ok, result = compile_cuda(str(tmp))
 
-        baseline_binary = result  # the compiled baseline binary
-        baseline_ms = benchmark(baseline_binary)
-        print(f"  baseline: {baseline_ms:.3f}ms")
-
         if not ok:
             err = str(result)[:400]
             print(f"  round {r}: COMPILE FAILED — {err[:80]}")
@@ -135,6 +135,10 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
                 + f"\n\n{optimized}"
             )
             continue
+
+        # baseline_binary = result  # the compiled baseline binary
+        # baseline_ms = benchmark(baseline_binary)
+        # print(f"  baseline: {baseline_ms:.3f}ms")
 
         print(f"  round {r}: validating...")
         val_ok, val_msg = run_validation(result)
@@ -243,6 +247,8 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
             f"OUTPUT RULES:\n"
             f"- Complete standalone .cu file\n"
             f"- Include main() that runs the kernel and prints SUCCESS if output matches CPU\n"
+            f"- You MUST use cudaEventRecord to measure kernel execution time.\n"          # <-- ADD THIS
+            f"- You MUST print the execution time to stdout exactly as: 'GPU Time: <ms>'\n" # <-- ADD THIS
             f"- float32 only\n"
             f"- No markdown, start with #include\n"
             f"- Must compile: nvcc -O2 -arch=sm_86\n"
@@ -263,12 +269,20 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
         cu_path.write_text(baseline_cuda)
 
         # verify baseline compiles
-        ok, err = compile_cuda(str(cu_path))
+        ok, baseline_bin = compile_cuda(str(cu_path))
         if not ok:
-            print(f"  baseline compile failed — skipping: {str(err)[:80]}")
+            print(f"  baseline compile failed — skipping: {str(baseline_bin)[:80]}")
             continue
 
-        print(f"  baseline compiled — now optimizing...")
+        # --- ADD THIS NEW VALIDATION BLOCK ---
+        print(f"  validating baseline...")
+        val_ok, val_msg = run_validation(baseline_bin)
+        if not val_ok:
+            print(f"  baseline validation failed — skipping: {str(val_msg)[:80]}")
+            continue
+        # -------------------------------------
+
+        print(f"  baseline validated — now optimizing...")
 
         # now run optimization loop on this CUDA file
         row = await optimize_one(cu_path, source=baseline_cuda)

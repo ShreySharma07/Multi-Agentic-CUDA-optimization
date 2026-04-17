@@ -1,84 +1,102 @@
+#include <cuda_runtime.h>
 #include <iostream>
 #include <vector>
 #include <cmath>
 #include <algorithm>
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 
-#define TILE_DIM 16
+#define B 8
+#define I 256
+#define J 512
+#define L 256
+#define K 768
 
-__global__ void einsum_4d_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int b, int i, int j, int l, int k) {
-    int b_idx = blockIdx.z;
-    int k_idx = blockIdx.x * TILE_DIM + threadIdx.x;
-    int ij_idx = blockIdx.y * TILE_DIM + threadIdx.y;
-    int i_idx = ij_idx / j;
-    int j_idx = ij_idx % j;
+__global__ void einsum_4d_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C) {
+    int b = blockIdx.z / (I / blockDim.y);
+    int i = (blockIdx.z % (I / blockDim.y)) * blockDim.y + threadIdx.y;
+    int j = blockIdx.y * blockDim.y + threadIdx.y; // Adjusted logic to map dimensions correctly
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (b_idx < b && i_idx < i && j_idx < j && k_idx < k) {
+    // Use a simpler mapping for clarity and performance
+    int global_b = blockIdx.z;
+    int global_i = blockIdx.y;
+    int global_j = blockIdx.x;
+    int global_k = threadIdx.x;
+
+    if (global_b < B && global_i < I && global_j < J && global_k < K) {
         float sum = 0.0f;
-        int offset_A = ((b_idx * i + i_idx) * j + j_idx) * l;
-        for (int l_idx = 0; l_idx < l; ++l_idx) {
-            sum += A[offset_A + l_idx] * B[l_idx * k + k_idx];
+        const float* row_A = &A[((global_b * I + global_i) * J + global_j) * L];
+        for (int l = 0; l < L; ++l) {
+            sum += row_A[l] * B[l * K + global_k];
         }
-        C[((b_idx * i + i_idx) * j + j_idx) * k + k_idx] = sum;
+        C[((global_b * I + global_i) * J + global_j) * K + global_k] = sum;
     }
 }
 
 int main() {
-    const int b = 2, i = 16, j = 32, l = 64, k = 32;
-    size_t size_A = (size_t)b * i * j * l * sizeof(float);
-    size_t size_B = (size_t)l * k * sizeof(float);
-    size_t size_C = (size_t)b * i * j * k * sizeof(float);
+    size_t sizeA = (size_t)B * I * J * L * sizeof(float);
+    size_t sizeB = (size_t)L * K * sizeof(float);
+    size_t sizeC = (size_t)B * I * J * K * sizeof(float);
 
-    std::vector<float> h_A(b * i * j * l);
-    std::vector<float> h_B(l * k);
-    std::vector<float> h_C(b * i * j * k);
-    std::vector<float> h_C_gpu(b * i * j * k);
-
-    for (auto& v : h_A) v = (float)rand() / RAND_MAX;
-    for (auto& v : h_B) v = (float)rand() / RAND_MAX;
+    std::vector<float> h_A(B * I * J * L), h_B(L * K), h_C(B * I * J * K);
+    for (auto& f : h_A) f = static_cast<float>(rand()) / RAND_MAX;
+    for (auto& f : h_B) f = static_cast<float>(rand()) / RAND_MAX;
 
     float *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, size_A);
-    cudaMalloc(&d_B, size_B);
-    cudaMalloc(&d_C, size_C);
+    cudaMalloc(&d_A, sizeA);
+    cudaMalloc(&d_B, sizeB);
+    cudaMalloc(&d_C, sizeC);
 
-    cudaMemcpy(d_A, h_A.data(), size_A, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B.data(), size_B, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A, h_A.data(), sizeA, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B.data(), sizeB, cudaMemcpyHostToDevice);
 
-    dim3 block(TILE_DIM, TILE_DIM);
-    dim3 grid((k + TILE_DIM - 1) / TILE_DIM, (i * j + TILE_DIM - 1) / TILE_DIM, b);
+    dim3 block(256);
+    dim3 grid(1, I, B * J); // Simplified for demonstration
 
-    einsum_4d_kernel<<<grid, block>>>(d_A, d_B, d_C, b, i, j, l, k);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    cudaMemcpy(h_C_gpu.data(), d_C, size_C, cudaMemcpyDeviceToHost);
+    cudaEventRecord(start);
+    // Optimized kernel launch configuration
+    einsum_4d_kernel<<<dim3(3, I, B), 256>>>(d_A, d_B, d_C);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
 
-    for (int b_idx = 0; b_idx < b; ++b_idx) {
-        for (int i_idx = 0; i_idx < i; ++i_idx) {
-            for (int j_idx = 0; j_idx < j; ++j_idx) {
-                for (int k_idx = 0; k_idx < k; ++k_idx) {
-                    float sum = 0.0f;
-                    for (int l_idx = 0; l_idx < l; ++l_idx) {
-                        sum += h_A[((b_idx * i + i_idx) * j + j_idx) * l + l_idx] * h_B[l_idx * k + k_idx];
-                    }
-                    h_C[((b_idx * i + i_idx) * j + j_idx) * k + k_idx] = sum;
-                }
-            }
-        }
-    }
+    float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    std::cout << "GPU Time: " << milliseconds << " ms" << std::endl;
+
+    cudaMemcpy(h_C.data(), d_C, sizeC, cudaMemcpyDeviceToHost);
 
     bool success = true;
-    for (size_t idx = 0; idx < h_C.size(); ++idx) {
-        float diff = std::abs(h_C_gpu[idx] - h_C[idx]);
-        float ref = std::abs(h_C[idx]);
-        if (diff > 1e-3f * std::max(1.0f, ref)) {
-            success = false;
-            break;
+    for (int b = 0; b < B; ++b) {
+        for (int i = 0; i < I; ++i) {
+            for (int j = 0; j < J; ++j) {
+                for (int k = 0; k < K; ++k) {
+                    float cpu_val = 0.0f;
+                    for (int l = 0; l < L; ++l) {
+                        cpu_val += h_A[((b * I + i) * J + j) * L + l] * h_B[l * K + k];
+                    }
+                    float gpu_val = h_C[((b * I + i) * J + j) * K + k];
+                    if (std::abs(gpu_val - cpu_val) > 1e-3 * std::max(1.0f, std::max(std::abs(gpu_val), std::abs(cpu_val)))) {
+                        success = false;
+                        break;
+                    }
+                }
+                if (!success) break;
+            }
+            if (!success) break;
         }
+        if (!success) break;
     }
 
-    std::cout << (success ? "SUCCESS" : "FAILURE") << std::endl;
+    if (success) std::cout << "SUCCESS" << std::endl;
+    else std::cout << "FAILURE" << std::endl;
 
-    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     return 0;
 }

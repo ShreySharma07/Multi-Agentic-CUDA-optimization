@@ -1,119 +1,147 @@
-#include <cuda_runtime.h>
-#include <cstdio>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <numeric>
 #include <algorithm>
-#include <cstdlib>
+#include <cuda_runtime.h>
 
-__global__ void hinge_loss_kernel(const float* __restrict__ predictions, const float* __restrict__ targets, double* global_sum, size_t total_elements, size_t N) {
-    double thread_sum = 0.0;
-    size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    size_t stride = (size_t)blockDim.x * gridDim.x;
+// Macro for checking CUDA errors
+#define CUDA_CHECK(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            fprintf(stderr, "CUDA error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(EXIT_FAILURE); \
+        } \
+    } while (0)
 
-    // Vectorize memory access using float4.
-    // N is 32768, which is divisible by 4.
-    const float4* preds4 = (const float4*)predictions;
-    const float4* targets4 = (const float4*)targets;
-    size_t total_elements4 = total_elements / 4;
-    size_t N4 = N / 4;
+// Combined kernel to compute element-wise hinge loss components and perform reduction sum
+__global__ void hinge_loss_reduction_kernel(const float* predictions, const float* targets, float* total_sum, int N) {
+    extern __shared__ float sdata[]; // Shared memory for block-level reduction
 
-    // Precalculate column index. Since stride (2048 * 256 = 524288) 
-    // is a multiple of N4 (8192), col_idx remains constant.
-    size_t col_idx = idx % N4;
+    unsigned int tid = threadIdx.x;
+    unsigned int global_idx = blockIdx.x * blockDim.x + tid;
 
-    for (size_t i = idx; i < total_elements4; i += stride) {
-        float4 p = preds4[i];
-        float4 t = targets4[col_idx];
-
-        // Use fmaxf to eliminate branching and optimize compute throughput.
-        thread_sum += (double)fmaxf(0.0f, 1.0f - p.x * t.x);
-        thread_sum += (double)fmaxf(0.0f, 1.0f - p.y * t.y);
-        thread_sum += (double)fmaxf(0.0f, 1.0f - p.z * t.z);
-        thread_sum += (double)fmaxf(0.0f, 1.0f - p.w * t.w);
+    // Each thread computes its hinge loss component for one element
+    float thread_local_sum = 0.0f;
+    if (global_idx < N) {
+        float val = 1.0f - predictions[global_idx] * targets[global_idx];
+        thread_local_sum = fmaxf(0.0f, val);
     }
 
-    __shared__ double sdata[256];
-    unsigned int tid = threadIdx.x;
-    sdata[tid] = thread_sum;
+    // Store thread's local sum in shared memory
+    sdata[tid] = thread_local_sum;
     __syncthreads();
 
-    // Block-level reduction
-    for (unsigned int s = blockDim.x / 2; s > 32; s >>= 1) {
+    // Perform reduction in shared memory within the block
+    // This loop efficiently sums values in shared memory
+    for (unsigned int s = blockDim.x / 2; s > 0; s /= 2) {
         if (tid < s) {
             sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
     }
 
-    if (tid < 32) {
-        // Warp-level reduction
-        double val = sdata[tid];
-        val += sdata[tid + 32];
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_down_sync(0xFFFFFFFF, val, offset);
-        }
-        if (tid == 0) {
-            atomicAdd(global_sum, val);
-        }
+    // The first thread of the block adds the block's total sum to the global total_sum
+    if (tid == 0) {
+        atomicAdd(total_sum, sdata[0]);
     }
 }
 
+
+float calculate_cpu_hinge_loss(const std::vector<float>& predictions, const std::vector<float>& targets, int N) {
+    float total_loss = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        total_loss += std::fmax(0.0f, 1.0f - predictions[i] * targets[i]);
+    }
+    return total_loss / N;
+}
+
 int main() {
-    const size_t N = 32768;
-    const size_t total_elements = N * N;
+    const int batch_size = 32768;
+    const int N = batch_size; // Total number of elements
 
-    float* h_preds = (float*)malloc(total_elements * sizeof(float));
-    float* h_targets = (float*)malloc(N * sizeof(float));
+    // Host memory allocation and initialization
+    std::vector<float> h_predictions(N);
+    std::vector<float> h_targets(N);
 
-    if (!h_preds || !h_targets) {
-        if (h_preds) free(h_preds);
-        if (h_targets) free(h_targets);
-        return 1;
+    // Initialize host data
+    // PyTorch reference: torch.rand(batch_size), torch.randint(0, 2, (batch_size,)).float() * 2 - 1
+    srand(42); // For reproducible results
+    for (int i = 0; i < N; ++i) {
+        h_predictions[i] = static_cast<float>(rand()) / static_cast<float>(RAND_MAX); // 0.0f to 1.0f
+        h_targets[i] = (rand() % 2 == 0) ? 1.0f : -1.0f; // -1.0f or 1.0f
     }
 
-    for (size_t i = 0; i < total_elements; ++i) {
-        h_preds[i] = (float)(i % 1024) / 1024.0f;
+    // Device memory allocation
+    float *d_predictions, *d_targets, *d_total_sum;
+    CUDA_CHECK(cudaMalloc((void**)&d_predictions, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d_targets, N * sizeof(float)));
+    CUDA_CHECK(cudaMalloc((void**)&d_total_sum, sizeof(float)));
+
+    // Initialize d_total_sum to 0.0f
+    CUDA_CHECK(cudaMemset(d_total_sum, 0, sizeof(float)));
+
+    // Copy data from host to device
+    CUDA_CHECK(cudaMemcpy(d_predictions, h_predictions.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_targets, h_targets.data(), N * sizeof(float), cudaMemcpyHostToDevice));
+
+    // Configure kernel launch parameters
+    const int threadsPerBlock = 256;
+    const int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+    // CUDA events for timing
+    cudaEvent_t start, stop;
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+
+    // Record start event
+    CUDA_CHECK(cudaEventRecord(start));
+
+    // Launch combined kernel
+    hinge_loss_reduction_kernel<<<blocksPerGrid, threadsPerBlock, threadsPerBlock * sizeof(float)>>>(d_predictions, d_targets, d_total_sum, N);
+    CUDA_CHECK(cudaGetLastError());
+
+    // Record stop event
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
+
+    float milliseconds = 0;
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
+
+    // Copy total sum from device to host
+    float h_total_sum_gpu;
+    CUDA_CHECK(cudaMemcpy(&h_total_sum_gpu, d_total_sum, sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Calculate final mean on GPU
+    float gpu_result = h_total_sum_gpu / N;
+
+    // Calculate CPU reference result
+    float cpu_result = calculate_cpu_hinge_loss(h_predictions, h_targets, N);
+
+    // Validate GPU output against CPU reference
+    bool success = false;
+    float tolerance = 1e-3f * std::max({1.0f, std::fabs(gpu_result), std::fabs(cpu_result)});
+    if (std::fabs(gpu_result - cpu_result) <= tolerance) {
+        success = true;
     }
-    for (size_t i = 0; i < N; ++i) {
-        h_targets[i] = (i % 2 == 0) ? 1.0f : -1.0f;
-    }
 
-    float *d_preds, *d_targets;
-    double *d_sum;
-    cudaMalloc(&d_preds, total_elements * sizeof(float));
-    cudaMalloc(&d_targets, N * sizeof(float));
-    cudaMalloc(&d_sum, sizeof(double));
-
-    cudaMemcpy(d_preds, h_preds, total_elements * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_targets, h_targets, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemset(d_sum, 0, sizeof(double));
-
-    int blockSize = 256;
-    int gridSize = 2048;
-    hinge_loss_kernel<<<gridSize, blockSize>>>(d_preds, d_targets, d_sum, total_elements, N);
-
-    double h_sum_gpu_db;
-    cudaMemcpy(&h_sum_gpu_db, d_sum, sizeof(double), cudaMemcpyDeviceToHost);
-    float gpu_result = (float)(h_sum_gpu_db / (double)total_elements);
-
-    double h_sum_cpu = 0.0;
-    for (size_t i = 0; i < total_elements; ++i) {
-        float val = 1.0f - h_preds[i] * h_targets[i % N];
-        if (val > 0.0f) h_sum_cpu += (double)val;
-    }
-    float cpu_result = (float)(h_sum_cpu / (double)total_elements);
-
-    float diff = fabsf(gpu_result - cpu_result);
-    float max_val = std::max({1.0f, fabsf(gpu_result), fabsf(cpu_result)});
-    if (diff <= 1e-3f * max_val) {
+    if (success) {
         printf("SUCCESS\n");
     } else {
-        printf("FAILURE: GPU=%f CPU=%f DIFF=%f\n", gpu_result, cpu_result, diff);
+        printf("FAILURE\n");
+        printf("CPU Result: %f, GPU Result: %f\n", cpu_result, gpu_result);
     }
+    printf("GPU Time: %f\n", milliseconds);
 
-    free(h_preds);
-    free(h_targets);
-    cudaFree(d_preds);
-    cudaFree(d_targets);
-    cudaFree(d_sum);
+    // Free device memory
+    CUDA_CHECK(cudaFree(d_predictions));
+    CUDA_CHECK(cudaFree(d_targets));
+    CUDA_CHECK(cudaFree(d_total_sum));
+
+    // Destroy events
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 
     return 0;
 }
