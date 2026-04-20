@@ -1,87 +1,114 @@
-#include <cuda_runtime.h>
-#include <stdio.h>
-#include <vector>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
 #include <algorithm>
+#include <cuda_runtime.h>
 
-#define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+#define N 4096
+#define TILE_SIZE 32
 
-__global__ void moe_align_kernel(
-    const int32_t* __restrict__ topk_ids,
-    int32_t* __restrict__ sorted_token_ids,
-    int32_t* __restrict__ expert_ids,
-    int32_t* __restrict__ total_tokens_post_pad,
-    int32_t num_experts,
-    int32_t block_size,
-    size_t numel) {
-    
-    // Using shared memory for reduction to avoid high global memory latency
-    extern __shared__ int32_t shared_counts[];
+__global__ void matmul_symmetric_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C) {
+    __shared__ float tileA[TILE_SIZE][TILE_SIZE];
+    __shared__ float tileB[TILE_SIZE][TILE_SIZE];
 
-    // Initialize counts
-    for (int i = threadIdx.x; i < num_experts; i += blockDim.x) {
-        shared_counts[i] = 0;
-    }
-    __syncthreads();
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
 
-    // Use private register-based counters to reduce atomic contention
-    int32_t local_counts[8] = {0}; 
-    for (size_t i = threadIdx.x; i < numel; i += blockDim.x) {
-        int eid = topk_ids[i];
-        if (eid >= 0 && eid < num_experts) {
-            local_counts[eid]++;
+    float sum = 0.0f;
+    for (int k_tile = 0; k_tile < (N + TILE_SIZE - 1) / TILE_SIZE; ++k_tile) {
+        int k = k_tile * TILE_SIZE;
+        
+        if (row < N && (k + threadIdx.x) < N)
+            tileA[threadIdx.y][threadIdx.x] = A[row * N + (k + threadIdx.x)];
+        else
+            tileA[threadIdx.y][threadIdx.x] = 0.0f;
+
+        if (col < N && (k + threadIdx.y) < N)
+            tileB[threadIdx.y][threadIdx.x] = B[(k + threadIdx.y) * N + col];
+        else
+            tileB[threadIdx.y][threadIdx.x] = 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            sum = fmaf(tileA[threadIdx.y][i], tileB[i][threadIdx.x], sum);
         }
+        __syncthreads();
     }
 
-    // Atomic reduction once per thread block
-    for (int i = 0; i < num_experts; ++i) {
-        if (local_counts[i] > 0) {
-            atomicAdd(&shared_counts[i], local_counts[i]);
-        }
-    }
-    __syncthreads();
-
-    // Single thread computes the total
-    if (threadIdx.x == 0) {
-        int32_t total = 0;
-        for (int i = 0; i < num_experts; ++i) {
-            int count = shared_counts[i];
-            total += CEILDIV(count, block_size) * block_size;
-        }
-        *total_tokens_post_pad = total;
+    if (row < N && col < N) {
+        C[row * N + col] = sum;
     }
 }
 
 int main() {
-    size_t numel = 1024 * 1024;
-    int32_t num_experts = 8;
-    int32_t block_size = 16;
-    
-    int32_t *d_topk, *d_sorted, *d_expert_ids, *d_total;
-    cudaMalloc(&d_topk, numel * sizeof(int32_t));
-    cudaMalloc(&d_sorted, numel * sizeof(int32_t));
-    cudaMalloc(&d_expert_ids, 1024 * sizeof(int32_t));
-    cudaMalloc(&d_total, sizeof(int32_t));
+    size_t size = (size_t)N * N * sizeof(float);
+    float *h_A = (float*)malloc(size);
+    float *h_B = (float*)malloc(size);
+    float *h_C = (float*)malloc(size);
+    float *h_C_ref = (float*)malloc(size);
 
-    std::vector<int32_t> h_topk(numel, 1);
-    cudaMemcpy(d_topk, h_topk.data(), numel * sizeof(int32_t), cudaMemcpyHostToDevice);
+    for (int i = 0; i < N * N; ++i) {
+        h_A[i] = (float)rand() / RAND_MAX;
+        h_B[i] = (float)rand() / RAND_MAX;
+    }
+    for (int i = 0; i < N; ++i) {
+        for (int j = i + 1; j < N; ++j) {
+            float valA = (h_A[i * N + j] + h_A[j * N + i]) * 0.5f;
+            h_A[i * N + j] = h_A[j * N + i] = valA;
+            float valB = (h_B[i * N + j] + h_B[j * N + i]) * 0.5f;
+            h_B[i * N + j] = h_B[j * N + i] = valB;
+        }
+    }
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc(&d_A, size);
+    cudaMalloc(&d_B, size);
+    cudaMalloc(&d_C, size);
+
+    cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (N + TILE_SIZE - 1) / TILE_SIZE);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
     cudaEventRecord(start);
-    // Best configuration for SM_86 on memory-bound workloads
-    moe_align_kernel<<<1024, 256, num_experts * sizeof(int32_t)>>>(
-        d_topk, d_sorted, d_expert_ids, d_total, num_experts, block_size, numel);
+
+    matmul_symmetric_kernel<<<grid, block>>>(d_A, d_B, d_C);
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-
-    float ms;
+    float ms = 0;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("GPU Time: %f\n", ms);
-    printf("SUCCESS\n");
 
-    cudaFree(d_topk); cudaFree(d_sorted); cudaFree(d_expert_ids); cudaFree(d_total);
-    cudaEventDestroy(start); cudaEventDestroy(stop);
+    cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            double sum = 0.0;
+            for (int k = 0; k < N; ++k) {
+                sum += (double)h_A[i * N + k] * (double)h_B[k * N + j];
+            }
+            h_C_ref[i * N + j] = (float)sum;
+        }
+    }
+
+    bool success = true;
+    for (size_t i = 0; i < (size_t)N * N; ++i) {
+        if (std::abs(h_C[i] - h_C_ref[i]) > 1e-3f * std::max(1.0f, std::max(std::abs(h_C[i]), std::abs(h_C_ref[i])))) {
+            success = false;
+            break;
+        }
+    }
+
+    if (success) printf("SUCCESS\n"); else printf("FAILURE\n");
+    printf("GPU Time: %f\n", ms);
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    free(h_A); free(h_B); free(h_C); free(h_C_ref);
     return 0;
 }

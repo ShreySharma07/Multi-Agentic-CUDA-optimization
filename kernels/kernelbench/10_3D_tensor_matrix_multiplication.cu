@@ -1,65 +1,65 @@
-#include <stdio.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <algorithm>
 #include <cuda_runtime.h>
-#include <stdlib.h>
 
 #define N 16
 #define M 1024
 #define K 2048
 #define L 768
 
-__global__ void matmul_3d_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C) {
+__global__ void matmul_3d_kernel(const float* A, const float* B, float* C) {
     int l = blockIdx.x * blockDim.x + threadIdx.x;
     int m = blockIdx.y * blockDim.y + threadIdx.y;
     int n = blockIdx.z;
 
-    if (l < L && m < M && n < N) {
+    if (l < L && m < M) {
         float sum = 0.0f;
-        int a_offset = n * M * K + m * K;
-        int b_offset = l;
         for (int k = 0; k < K; ++k) {
-            sum += A[a_offset + k] * B[k * L + b_offset];
+            sum += A[n * M * K + m * K + k] * B[k * L + l];
         }
         C[n * M * L + m * L + l] = sum;
     }
 }
 
 int main() {
-    size_t size_A = (size_t)N * M * K * sizeof(float);
-    size_t size_B = (size_t)K * L * sizeof(float);
-    size_t size_C = (size_t)N * M * L * sizeof(float);
+    size_t sizeA = (size_t)N * M * K * sizeof(float);
+    size_t sizeB = (size_t)K * L * sizeof(float);
+    size_t sizeC = (size_t)N * M * L * sizeof(float);
 
-    float *h_A = (float*)malloc(size_A);
-    float *h_B = (float*)malloc(size_B);
-    float *h_C = (float*)malloc(size_C);
-    float *h_C_ref = (float*)malloc(size_C);
+    float *h_A = (float*)malloc(sizeA);
+    float *h_B = (float*)malloc(sizeB);
+    float *h_C = (float*)malloc(sizeC);
+    float *h_C_ref = (float*)malloc(sizeC);
 
     for (size_t i = 0; i < (size_t)N * M * K; ++i) h_A[i] = (float)rand() / RAND_MAX;
     for (size_t i = 0; i < (size_t)K * L; ++i) h_B[i] = (float)rand() / RAND_MAX;
 
     float *d_A, *d_B, *d_C;
-    cudaMalloc(&d_A, size_A);
-    cudaMalloc(&d_B, size_B);
-    cudaMalloc(&d_C, size_C);
+    cudaMalloc(&d_A, sizeA);
+    cudaMalloc(&d_B, sizeB);
+    cudaMalloc(&d_C, sizeC);
 
-    cudaMemcpy(d_A, h_A, size_A, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B, size_B, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A, h_A, sizeA, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, sizeB, cudaMemcpyHostToDevice);
 
-    dim3 block(16, 16);
+    dim3 block(32, 16);
     dim3 grid((L + block.x - 1) / block.x, (M + block.y - 1) / block.y, N);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
     cudaEventRecord(start);
+
     matmul_3d_kernel<<<grid, block>>>(d_A, d_B, d_C);
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
 
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-
-    cudaMemcpy(h_C, d_C, size_C, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_C, d_C, sizeC, cudaMemcpyDeviceToHost);
 
     for (int n = 0; n < N; ++n) {
         for (int m = 0; m < M; ++m) {
@@ -75,18 +75,14 @@ int main() {
 
     bool success = true;
     for (size_t i = 0; i < (size_t)N * M * L; ++i) {
-        float diff = h_C[i] - h_C_ref[i];
-        if (diff < 0) diff = -diff;
-        float tol = 1e-3f * (1.0f + (h_C[i] > h_C_ref[i] ? h_C[i] : h_C_ref[i]));
-        if (diff > tol) {
+        if (std::abs(h_C[i] - h_C_ref[i]) > 1e-4f * std::max(1.0f, std::max(std::abs(h_C[i]), std::abs(h_C_ref[i])))) {
             success = false;
             break;
         }
     }
 
-    if (success) printf("SUCCESS\n");
-    else printf("FAILURE\n");
-    printf("GPU Time: %f\n", milliseconds);
+    if (success) printf("SUCCESS\n"); else printf("FAILURE\n");
+    printf("GPU Time: %f\n", ms);
 
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     free(h_A); free(h_B); free(h_C); free(h_C_ref);

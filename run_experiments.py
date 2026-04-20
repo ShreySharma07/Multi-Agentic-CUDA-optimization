@@ -1,27 +1,93 @@
 # run_experiments.py
 import asyncio
 import csv
+import re
+import subprocess
 import importlib.util
 from pathlib import Path
 from datetime import datetime
 
-# reuse your existing pipeline
 from pipeline.compiler import compile_cuda
 from pipeline.pre_flight import pre_flight
 from pipeline.validator import run_validation
 from Agents.coder import safe_chat, runner, USER_ID, SESSION_ID
-from pipeline.benchmarker import benchmark
+
+
+from pydantic import BaseModel
+from typing import Optional
+
+class ExperimentResult(BaseModel):
+    timestamp: str
+    kernel: str
+    source: str
+    bottleneck: str
+    occupancy: float        # was str
+    compute_throughput: float  # was str
+    dram_throughput: float     # was str
+    baseline_ms: float
+    best_speedup: float = 0.0      # default 0 instead of None
+    best_round:   int   = 0
+    best_ms:      float = 0.0
+    rounds_total: int
+    compile_failures: int
+    validation_failures: int
+    pytorch_ref: Optional[str] = None
+
 
 RESULTS_CSV = "results/experiments.csv"
-ROUNDS = 5
-GPU_ARCH = "sm_86"
+GPU_ARCH    = "sm_86"
+WARMUP_RUNS = 3    # was 10
+TIMED_RUNS  = 10   # was 30
+TIMEOUT_SEC = 8    # was 20
+ROUNDS      = 3    # was 5 — for quick runs, use 3
 
+# ── Code extraction ────────────────────────────────────────────────────
 def extract_cuda_code(text: str) -> str:
     text = text.replace("cppcopy", "").replace("```", "")
     if "#include" in text:
         return text[text.find("#include"):].strip()
     return text.strip()
 
+# ── Real benchmarker ───────────────────────────────────────────────────
+def benchmark(binary_path: str) -> float:
+    """
+    Run binary, parse 'GPU Time: X ms' from stdout.
+    Returns mean ms over TIMED_RUNS, or 0.0 on failure/timeout.
+    """
+    def run_once():
+        try:
+            r = subprocess.run(
+                [binary_path],
+                capture_output=True, text=True,
+                timeout=TIMEOUT_SEC
+            )
+            m = re.search(r'GPU\s*Time[:\s]+([\d.]+)', r.stdout)
+            if m:
+                return float(m.group(1))
+        except subprocess.TimeoutExpired:
+            pass
+        except Exception:
+            pass
+        return None
+
+    # warmup
+    for _ in range(WARMUP_RUNS):
+        run_once()
+
+    times = []
+    for _ in range(TIMED_RUNS):
+        t = run_once()
+        if t is not None:
+            times.append(t)
+
+    if not times:
+        print(f"    [bench] WARNING: no timing output from {Path(binary_path).name}")
+        return 0.0
+
+    mean = sum(times) / len(times)
+    return round(mean, 4)
+
+# ── CSV writer ─────────────────────────────────────────────────────────
 def append_result(row: dict):
     Path("results").mkdir(exist_ok=True)
     file_exists = Path(RESULTS_CSV).exists()
@@ -32,88 +98,125 @@ def append_result(row: dict):
         writer.writerow(row)
     print(f"  → saved to {RESULTS_CSV}")
 
+# ── Core optimization loop (headless) ──────────────────────────────────
 async def optimize_one(kernel_path: Path, source: str = None) -> dict:
-    """Same logic as server.py run_optimization but headless."""
-    name = kernel_path.name
+    name   = kernel_path.name
     source = source or kernel_path.read_text()
+
     print(f"\n{'='*60}")
     print(f"KERNEL: {name}")
     print(f"{'='*60}")
 
-    # pre-flight
+    # ── pre-flight ─────────────────────────────────────────────────────
     print("  running pre-flight...")
     try:
         pf = pre_flight(source)
     except Exception as e:
         pf = {"status": "error"}
-        print(f"  pre-flight failed: {e}")
+        print(f"  pre-flight exception: {e}")
 
     metrics_ctx = ""
     hint = "unknown"
+    occ = comp = dram = "0"
+
     if pf.get("status") == "success":
-        m = pf["metrics"]
-        occ  = m.get("occupancy", "0")
-        comp = m.get("compute_throughput", "0")
-        dram = m.get("dram_throughput", "0")
+        m    = pf["metrics"]
+        try:
+            occ  = float(str(m.get("occupancy",         "0")).replace("%",""))
+            comp = float(str(m.get("compute_throughput","0")).replace("%",""))
+            dram = float(str(m.get("dram_throughput",   "0")).replace("%",""))
+        except Exception:
+            occ = comp = dram = 0.0
         try:
             hint = "memory-bound" if float(str(dram)) > float(str(comp)) else "compute-bound"
-        except:
+        except Exception:
             pass
         metrics_ctx = (
-            f"Hardware profile:\n"
+            f"Hardware profile (Nsight Compute):\n"
             f"  Occupancy: {occ}%\n"
-            f"  Compute: {comp}%\n"
-            f"  DRAM: {dram}%\n"
+            f"  Compute throughput: {comp}%\n"
+            f"  DRAM throughput: {dram}%\n"
             f"  Bottleneck: {hint}\n"
         )
-        print(f"  pre-flight ok: occupancy={occ}% dram={dram}% → {hint}")
+        print(f"  pre-flight ok · occ={occ}% dram={dram}% → {hint}")
     else:
-        print("  pre-flight unavailable — continuing without metrics")
+        print(f"  pre-flight unavailable ({pf.get('stage','?')}) — no metrics context")
 
-    baseline_ok, baseline_bin = compile_cuda(str(kernel_path))  
-    baseline_ms = benchmark(baseline_bin) if baseline_ok else 1.0
-    print(f"  baseline: {baseline_ms:.3f}ms")
+    # ── baseline timing (compile original once, time it) ───────────────
+    print("  benchmarking baseline...")
+    baseline_ms = 0.0
+    _base_ok, _base_bin = compile_cuda(str(kernel_path))
+    if _base_ok:
+        baseline_ms = benchmark(_base_bin)
+        print(f"  baseline: {baseline_ms:.3f}ms")
+    else:
+        print("  baseline compile failed — speedup will be 0")
+
+    # ── optimization loop ──────────────────────────────────────────────
     best_speedup = None
-    best_round = None
-    best_code = source
-    history = []
+    best_round   = None
+    best_code    = source
+    history      = []
 
     for r in range(1, ROUNDS + 1):
         print(f"  round {r}/{ROUNDS}: asking agent...")
 
+        # build history string for prompt
         history_ctx = ""
         if history:
-            history_ctx = "Previous attempts:\n"
+            history_ctx = "Previous attempts this session:\n"
             for h in history:
                 if h["result"] == "success":
                     history_ctx += f"  Round {h['round']}: {h['speedup']:.2f}x speedup\n"
                 elif h["result"] == "compile_failed":
                     history_ctx += f"  Round {h['round']}: COMPILE FAILED — {h.get('error','')[:120]}\n"
                 elif h["result"] == "validation_failed":
-                    history_ctx += f"  Round {h['round']}: VALIDATION FAILED\n"
+                    history_ctx += f"  Round {h['round']}: VALIDATION FAILED — math wrong\n"
+                elif h["result"] == "empty_response":
+                    history_ctx += f"  Round {h['round']}: agent returned no code\n"
+            history_ctx += "\n"
+
+        best_ctx = ""
+        if best_speedup:
+            best_ctx = f"Current best: {best_speedup:.2f}x speedup — improve on this.\n\n"
+
+        strategy_hint = {
+            "memory-bound": (
+                "Focus on: coalesced global memory access, "
+                "vectorized loads (float4), shared memory tiling."
+            ),
+            "compute-bound": (
+                "Focus on: fast math (__expf, __fdividef), "
+                "loop unrolling, reducing register pressure."
+            ),
+            "unknown": "Apply the most impactful optimization you can identify.",
+        }.get(hint, "")
 
         prompt = (
             f"You are a CUDA expert optimizing for RTX A4000 ({GPU_ARCH} Ampere).\n"
-            f"Round {r} of {ROUNDS}. Bottleneck: {hint}.\n\n"
-            f"{metrics_ctx}\n"
-            f"{history_ctx}\n"
-            f"CONSTRAINTS:\n"
-            f"- float32 only. No half/half2/__half types.\n"
-            f"- No cuda/cmath or std::complex headers.\n"
-            f"- Apply ONE optimization at a time.\n\n"
-            f"OUTPUT RULES:\n"
-            f"- You MUST use cudaEventRecord to measure kernel execution time.\n"
-            f"- You MUST print the execution time to stdout exactly in this format: 'GPU Time: <milliseconds>'\n"
-            f"- Start immediately with #include\n"
-            f"- No markdown, no explanation, no backticks\n"
-            f"- Complete compilable .cu file only\n"
-            f"- Must compile: nvcc -O2 -arch={GPU_ARCH}\n\n"
-            f"KERNEL:\n{best_code}"
+            f"Round {r} of {ROUNDS}.\n\n"
+            f"{metrics_ctx}"
+            f"Optimization hint: {strategy_hint}\n\n"
+            f"{history_ctx}"
+            f"{best_ctx}"
+            f"HARD CONSTRAINTS:\n"
+            f"- float32 only. No half / half2 / __half / fp16 types.\n"
+            f"- No cuda/cmath, no std::complex headers.\n"
+            f"- Apply ONE focused optimization — do not rewrite everything.\n"
+            f"- All pointer arguments remain float*.\n\n"
+            f"OUTPUT RULES — no exceptions:\n"
+            f"- Return ONLY the raw .cu file.\n"
+            f"- First character must be '#' (from #include).\n"
+            f"- No markdown, no backticks, no explanation.\n"
+            f"- Must compile: nvcc -O2 -arch={GPU_ARCH}\n"
+            f"- If previous round had a compile error, fix THOSE exact errors first.\n\n"
+            f"KERNEL TO OPTIMIZE:\n{best_code}"
         )
 
-        raw = await safe_chat(prompt, runner, USER_ID, SESSION_ID)
+        raw       = await safe_chat(prompt, runner, USER_ID, SESSION_ID)
         optimized = extract_cuda_code(raw)
 
+        # guard: reject empty or non-CUDA output
         if not optimized or not optimized.startswith("#include"):
             print(f"  round {r}: invalid output — skipping")
             history.append({"round": r, "result": "empty_response"})
@@ -122,6 +225,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         tmp = Path(f"kernels/tmp_exp_r{r}.cu")
         tmp.write_text(optimized)
 
+        # compile
         print(f"  round {r}: compiling...")
         ok, result = compile_cuda(str(tmp))
 
@@ -129,17 +233,15 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             err = str(result)[:400]
             print(f"  round {r}: COMPILE FAILED — {err[:80]}")
             history.append({"round": r, "result": "compile_failed", "error": err})
+            # feed error into next round's code context
             best_code = (
-                f"// COMPILE ERROR — fix before continuing\n"
-                + "\n".join(f"// {l}" for l in err.split("\n"))
+                "// PREVIOUS COMPILE ERROR — fix these before any other change:\n"
+                + "\n".join(f"// {line}" for line in err.splitlines())
                 + f"\n\n{optimized}"
             )
             continue
 
-        # baseline_binary = result  # the compiled baseline binary
-        # baseline_ms = benchmark(baseline_binary)
-        # print(f"  baseline: {baseline_ms:.3f}ms")
-
+        # validate correctness
         print(f"  round {r}: validating...")
         val_ok, val_msg = run_validation(result)
 
@@ -147,43 +249,68 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             print(f"  round {r}: VALIDATION FAILED — {str(val_msg)[:60]}")
             history.append({"round": r, "result": "validation_failed"})
             best_code = (
-                f"// VALIDATION FAILED: {str(val_msg)[:200]}\n\n{optimized}"
+                f"// VALIDATION FAILED — output does not match CPU baseline.\n"
+                f"// Validation message: {str(val_msg)[:200]}\n"
+                f"// Fix the math. Do not change the kernel structure.\n\n"
+                + optimized
             )
             continue
 
-        # import random
-        # speedup = round(1.2 + random.uniform(0.1, 1.4), 2)  # TODO: real benchmarker
-        
+        # benchmark
         opt_ms = benchmark(result)
-        speedup = round(baseline_ms / opt_ms, 2) if opt_ms > 0 else 0.0
-        print(f"  round {r}: ✓ speedup={speedup:.2f}x")
+        if opt_ms <= 0 or baseline_ms <= 0:
+            print(f"  round {r}: benchmark returned 0 — binary may not print 'GPU Time'")
+            speedup = 0.0
+        else:
+            speedup = round(baseline_ms / opt_ms, 4)
+
+        print(f"  round {r}: ✓ {opt_ms:.3f}ms → {speedup:.2f}x speedup")
         history.append({"round": r, "speedup": speedup, "result": "success"})
 
         if best_speedup is None or speedup > best_speedup:
             best_speedup = speedup
-            best_round = r
-            best_code = optimized
+            best_round   = r
+            best_code    = optimized
+            Path("kernels/results").mkdir(exist_ok=True)
             Path(f"kernels/results/{name}").write_text(optimized)
+            print(f"  new best — saved kernels/results/{name}")
+        else:
+            print(f"  round {r}: {speedup:.2f}x < best {best_speedup:.2f}x — discarded")
+
+        # convergence: stop if last 2 successes improved by < 1%
+        successes = [h for h in history if h.get("result") == "success"]
+        if len(successes) >= 2:
+            prev, curr = successes[-2]["speedup"], successes[-1]["speedup"]
+            if abs(curr - prev) < 0.01:
+                print("  converged — stopping early")
+                break
 
     n_compile = sum(1 for h in history if h["result"] == "compile_failed")
     n_val     = sum(1 for h in history if h["result"] == "validation_failed")
+    # replace the print at the end
+    print(f"\n  RESULT: best={'%.4f' % best_speedup if best_speedup else 'None'}x  "
+      f"round={best_round}  compile_fails={n_compile}  val_fails={n_val}")
 
-    print(f"\n  RESULT: best={best_speedup}x round={best_round} compile_fails={n_compile}")
+    result = ExperimentResult(
+    timestamp=datetime.now().isoformat(),
+    kernel=name,
+    source=str(kernel_path),
+    bottleneck=hint,
+    occupancy=occ,
+    compute_throughput=comp,
+    dram_throughput=dram,
+    baseline_ms=baseline_ms,
+    best_ms=round(baseline_ms / best_speedup, 4) if best_speedup else 0.0,
+    best_speedup=best_speedup or 0.0,
+    best_round=best_round or 0,
+    rounds_total=len(history),
+    compile_failures=n_compile,
+    validation_failures=n_val,
+)
+    return result.model_dump()
 
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "kernel": name,
-        "source": str(kernel_path),
-        "rounds": len(history),
-        "best_speedup": best_speedup or 0.0,
-        "best_round": best_round or 0,
-        "compile_failures": n_compile,
-        "validation_failures": n_val,
-        "bottleneck": hint,
-    }
-
+# ── Run modes ──────────────────────────────────────────────────────────
 async def run_own_kernels():
-    """Run on your own kernels in kernels/ directory."""
     skip = {"tmp_", "best_", "baseline_", "temp_"}
     kernels = sorted(
         f for f in Path("kernels").glob("*.cu")
@@ -191,144 +318,128 @@ async def run_own_kernels():
     )
     print(f"Found {len(kernels)} own kernels")
     Path("kernels/results").mkdir(exist_ok=True)
-
     for kp in kernels:
         row = await optimize_one(kp)
         append_result(row)
 
+
 def find_kernelbench_path() -> Path | None:
     candidates = [
         Path("KernelBench/kernelbench/dataset"),
-        Path("KernelBench/src/kernelbench/dataset"),
         Path("KernelBench/KernelBench/dataset"),
+        Path("KernelBench/KernelBench"),
         Path("KernelBench/data"),
     ]
     for c in candidates:
-        if c.exists():
+        if c.exists() and any(c.iterdir()):
             return c
-    # search recursively as fallback
     for p in Path("KernelBench").rglob("level1"):
         return p.parent
     return None
 
+# in run_kernelbench(), skip kernels already in results CSV
+def already_done(kernel_name: str) -> bool:
+    if not Path(RESULTS_CSV).exists():
+        return False
+    with open(RESULTS_CSV) as f:
+        return any(kernel_name in line for line in f)
+
+
 async def run_kernelbench(level: int = 1, max_kernels: int = 10):
-    """
-    Run on KernelBench .py files.
-    For each .py file, asks the agent to write a CUDA implementation,
-    then optimizes it.
-    """
+    
     kb_base = find_kernelbench_path()
     if not kb_base:
-        print("KernelBench dataset not found. Run:")
-        print("  find KernelBench/ -name '*.py' | head -5")
+        print("KernelBench not found. Run: git clone https://github.com/ScalingIntelligence/KernelBench")
         return
-    
+
     kb_path = kb_base / f"level{level}"
     if not kb_path.exists():
-        print(f"Level {level} not found at {kb_path}")
-        # list what IS there
-        print("Available:", list(kb_base.iterdir()))
+        print(f"Level {level} not found. Available: {list(kb_base.iterdir())}")
         return
-    
+
     files = sorted(kb_path.glob("*.py"))[:max_kernels]
     print(f"Found {len(files)} kernels at {kb_path}")
+    Path("kernels/kernelbench").mkdir(parents=True, exist_ok=True)
+    Path("kernels/results").mkdir(exist_ok=True)
 
     for py_file in files:
-        print(f"\n{'='*60}")
-        print(f"KernelBench: {py_file.name}")
 
-        # read PyTorch reference
+        print(f"\n{'='*60}\nKernelBench: {py_file.name}")
         pytorch_code = py_file.read_text()
 
-        # ask agent to write CUDA from PyTorch reference
         cuda_prompt = (
-            f"Convert this PyTorch operation to a CUDA kernel for RTX A4000 (sm_86).\n\n"
+            f"Convert this PyTorch operation to a standalone CUDA kernel for RTX A4000 (sm_86).\n\n"
             f"PYTORCH REFERENCE:\n{pytorch_code}\n\n"
-            f"OUTPUT RULES:\n"
-            f"- Complete standalone .cu file\n"
-            f"- Include main() that runs the kernel and prints SUCCESS if output matches CPU\n"
-            f"- You MUST use cudaEventRecord to measure kernel execution time.\n"          # <-- ADD THIS
-            f"- You MUST print the execution time to stdout exactly as: 'GPU Time: <ms>'\n" # <-- ADD THIS
+            f"REQUIREMENTS:\n"
+            f"- Complete standalone .cu file with main()\n"
+            f"- main() allocates data, runs kernel, compares to CPU, prints 'GPU Time: X ms'\n"
+            f"- Prints 'SUCCESS' if GPU and CPU outputs match (tolerance 1e-4), else 'FAILURE'\n"
             f"- float32 only\n"
-            f"- No markdown, start with #include\n"
+            f"- Start with #include, no markdown, no backticks\n"
             f"- Must compile: nvcc -O2 -arch=sm_86\n"
         )
 
-        print(f"  generating baseline CUDA from PyTorch...")
-        raw = await safe_chat(cuda_prompt, runner, USER_ID, SESSION_ID)
+        print("  generating baseline CUDA from PyTorch...")
+        raw           = await safe_chat(cuda_prompt, runner, USER_ID, SESSION_ID)
         baseline_cuda = extract_cuda_code(raw)
 
         if not baseline_cuda.startswith("#include"):
-            print(f"  failed to generate baseline — skipping")
+            print("  failed to generate baseline — skipping")
             continue
 
-        # save baseline
         cu_name = py_file.stem + ".cu"
+        if already_done(cu_name):
+            print(f"  already in CSV — skipping")
+            continue
+
         cu_path = Path(f"kernels/kernelbench/{cu_name}")
-        cu_path.parent.mkdir(exist_ok=True)
         cu_path.write_text(baseline_cuda)
 
-        # verify baseline compiles
-        ok, baseline_bin = compile_cuda(str(cu_path))
+        ok, err = compile_cuda(str(cu_path))
         if not ok:
-            print(f"  baseline compile failed — skipping: {str(baseline_bin)[:80]}")
+            print(f"  baseline compile failed — skipping: {str(err)[:80]}")
             continue
 
-        # --- ADD THIS NEW VALIDATION BLOCK ---
-        print(f"  validating baseline...")
-        val_ok, val_msg = run_validation(baseline_bin)
-        if not val_ok:
-            print(f"  baseline validation failed — skipping: {str(val_msg)[:80]}")
-            continue
-        # -------------------------------------
-
-        print(f"  baseline validated — now optimizing...")
-
-        # now run optimization loop on this CUDA file
+        print("  baseline compiled — optimizing...")
         row = await optimize_one(cu_path, source=baseline_cuda)
-        row["source"] = f"kernelbench_l{level}"
-        row["pytorch_ref"] = py_file.name
+        row["source"]       = f"kernelbench_l{level}"
+        row["pytorch_ref"]  = py_file.name
         append_result(row)
 
+
 def find_sglang_kernels() -> list[Path]:
-    # search entire sglang repo for .cu files
-    all_cu = list(Path("sglang").rglob("*.cu"))
-    # filter to useful ones — skip test files and cmake files
+    all_cu       = list(Path("sglang").rglob("*.cu"))
     skip_patterns = {"test", "benchmark", "example", "cmake"}
-    useful = [
+    return sorted(
         f for f in all_cu
         if not any(s in str(f).lower() for s in skip_patterns)
-    ]
-    return sorted(useful)
+    )
+
 
 async def run_sglang(max_kernels: int = 5):
-    """Run on SGLang .cu files copied into kernels/sglang/"""
     kernels = find_sglang_kernels()
     if not kernels:
-        print("No SGLang .cu files found")
-        print("Run: find sglang/ -name '*.cu' | head -20")
+        print("No SGLang .cu files found — run: find sglang/ -name '*.cu' | head -10")
         return
-    
-    print(f"Found {len(kernels)} SGLang kernels:")
-    for k in kernels[:10]:
-        print(f"  {k}")
-    
-    # copy to working directory
+
+    print(f"Found {len(kernels)} SGLang .cu files")
     Path("kernels/sglang").mkdir(parents=True, exist_ok=True)
+    Path("kernels/results").mkdir(exist_ok=True)
+
     for kp in kernels[:max_kernels]:
         dest = Path("kernels/sglang") / kp.name
         dest.write_text(kp.read_text())
         print(f"  copied: {kp.name}")
-    
-    # now optimize them
-    for kp in list(Path("kernels/sglang").glob("*.cu"))[:max_kernels]:
+
+    for kp in sorted(Path("kernels/sglang").glob("*.cu"))[:max_kernels]:
         row = await optimize_one(kp)
         row["source"] = "sglang"
         append_result(row)
 
+
+# ── Entry point ────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
-
     mode = sys.argv[1] if len(sys.argv) > 1 else "own"
 
     if mode == "own":

@@ -1,8 +1,8 @@
-#include <cuda_runtime.h>
-#include <iostream>
-#include <vector>
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <algorithm>
+#include <cuda_runtime.h>
 
 #define B 8
 #define I 256
@@ -11,24 +11,20 @@
 #define K 768
 
 __global__ void einsum_4d_kernel(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C) {
-    int b = blockIdx.z / (I / blockDim.y);
-    int i = (blockIdx.z % (I / blockDim.y)) * blockDim.y + threadIdx.y;
-    int j = blockIdx.y * blockDim.y + threadIdx.y; // Adjusted logic to map dimensions correctly
     int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    int i_b = blockIdx.z;
 
-    // Use a simpler mapping for clarity and performance
-    int global_b = blockIdx.z;
-    int global_i = blockIdx.y;
-    int global_j = blockIdx.x;
-    int global_k = threadIdx.x;
+    int i = i_b / B;
+    int b = i_b % B;
 
-    if (global_b < B && global_i < I && global_j < J && global_k < K) {
+    if (k < K && j < J) {
         float sum = 0.0f;
-        const float* row_A = &A[((global_b * I + global_i) * J + global_j) * L];
+        int a_offset = ((b * I + i) * J + j) * L;
         for (int l = 0; l < L; ++l) {
-            sum += row_A[l] * B[l * K + global_k];
+            sum += A[a_offset + l] * B[l * K + k];
         }
-        C[((global_b * I + global_i) * J + global_j) * K + global_k] = sum;
+        C[((b * I + i) * J + j) * K + k] = sum;
     }
 }
 
@@ -37,66 +33,65 @@ int main() {
     size_t sizeB = (size_t)L * K * sizeof(float);
     size_t sizeC = (size_t)B * I * J * K * sizeof(float);
 
-    std::vector<float> h_A(B * I * J * L), h_B(L * K), h_C(B * I * J * K);
-    for (auto& f : h_A) f = static_cast<float>(rand()) / RAND_MAX;
-    for (auto& f : h_B) f = static_cast<float>(rand()) / RAND_MAX;
+    float *h_A = (float*)malloc(sizeA);
+    float *h_B = (float*)malloc(sizeB);
+    float *h_C = (float*)malloc(sizeC);
+    float *h_C_ref = (float*)malloc(sizeC);
+
+    for (size_t i = 0; i < (size_t)B * I * J * L; ++i) h_A[i] = (float)rand() / RAND_MAX;
+    for (size_t i = 0; i < (size_t)L * K; ++i) h_B[i] = (float)rand() / RAND_MAX;
 
     float *d_A, *d_B, *d_C;
     cudaMalloc(&d_A, sizeA);
     cudaMalloc(&d_B, sizeB);
     cudaMalloc(&d_C, sizeC);
 
-    cudaMemcpy(d_A, h_A.data(), sizeA, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_B, h_B.data(), sizeB, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_A, h_A, sizeA, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, sizeB, cudaMemcpyHostToDevice);
 
-    dim3 block(256);
-    dim3 grid(1, I, B * J); // Simplified for demonstration
+    dim3 block(16, 16);
+    dim3 grid((K + block.x - 1) / block.x, (J + block.y - 1) / block.y, B * I);
 
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-
     cudaEventRecord(start);
-    // Optimized kernel launch configuration
-    einsum_4d_kernel<<<dim3(3, I, B), 256>>>(d_A, d_B, d_C);
+
+    einsum_4d_kernel<<<grid, block>>>(d_A, d_B, d_C);
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, start, stop);
 
-    float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
-    std::cout << "GPU Time: " << milliseconds << " ms" << std::endl;
+    cudaMemcpy(h_C, d_C, sizeC, cudaMemcpyDeviceToHost);
 
-    cudaMemcpy(h_C.data(), d_C, sizeC, cudaMemcpyDeviceToHost);
-
-    bool success = true;
     for (int b = 0; b < B; ++b) {
         for (int i = 0; i < I; ++i) {
             for (int j = 0; j < J; ++j) {
                 for (int k = 0; k < K; ++k) {
-                    float cpu_val = 0.0f;
+                    double sum = 0.0;
                     for (int l = 0; l < L; ++l) {
-                        cpu_val += h_A[((b * I + i) * J + j) * L + l] * h_B[l * K + k];
+                        sum += (double)h_A[(((b * I + i) * J + j) * L + l)] * (double)h_B[l * K + k];
                     }
-                    float gpu_val = h_C[((b * I + i) * J + j) * K + k];
-                    if (std::abs(gpu_val - cpu_val) > 1e-3 * std::max(1.0f, std::max(std::abs(gpu_val), std::abs(cpu_val)))) {
-                        success = false;
-                        break;
-                    }
+                    h_C_ref[(((b * I + i) * J + j) * K + k)] = (float)sum;
                 }
-                if (!success) break;
             }
-            if (!success) break;
         }
-        if (!success) break;
     }
 
-    if (success) std::cout << "SUCCESS" << std::endl;
-    else std::cout << "FAILURE" << std::endl;
+    bool success = true;
+    for (size_t i = 0; i < (size_t)B * I * J * K; ++i) {
+        if (std::abs(h_C[i] - h_C_ref[i]) > 1e-4f * std::max(1.0f, std::max(std::abs(h_C[i]), std::abs(h_C_ref[i])))) {
+            success = false;
+            break;
+        }
+    }
 
-    cudaFree(d_A);
-    cudaFree(d_B);
-    cudaFree(d_C);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    if (success) printf("SUCCESS\n"); else printf("FAILURE\n");
+    printf("GPU Time: %f\n", ms);
+
+    cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
+    free(h_A); free(h_B); free(h_C); free(h_C_ref);
     return 0;
 }
