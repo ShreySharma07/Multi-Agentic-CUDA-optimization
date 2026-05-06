@@ -15,8 +15,9 @@ def compile_cuda(file_path: str):
     
     nvcc_path = utils.find_cuda_tool('nvcc')
     
-    cmd = [nvcc_path, abs_file_path, '-o', executable, '-O3', f'-arch={arch}', '-lineinfo']
-
+    cmd = ['nvcc', str(file_path), '-o', executable, 
+        '-O2', f'-arch={arch}', '-lineinfo',
+        '-lcublas', '-lcurand']  # add these
     try:
         process = subprocess.run(cmd, capture_output=True, text=True)
 

@@ -26,10 +26,10 @@ logging.basicConfig(level=logging.ERROR)
 
 DIRECTORY_PATH = Path("kernels")
 
-AGENT_MODEL = "gemini-3.1-flash-lite-preview"
+# AGENT_MODEL = "gemini-3.1-flash-lite-preview"
 # AGENT_MODEL = "gemini-3-flash-preview"
 # AGENT_MODEL = "claude-sonnet-4-6"
-# AGENT_MODEL = "gemini-2.5-flash"
+AGENT_MODEL = "gemini-2.5-flash"
 
 PROMPT = f"""
 You are a CUDA optimization expert for RTX A4000 (sm_86).
@@ -174,32 +174,19 @@ import asyncio
 import asyncio
 import random
 
-async def safe_chat(prompt, runner, user_id, session_id):
-    max_retries = 7
-    base_wait_time = 5  # start with a 5 second wait
-    
+async def safe_chat(prompt, runner, user_id, session_id, max_retries=5):
     for attempt in range(max_retries):
         try:
             return await chat(prompt, runner, user_id, session_id)
-        
         except Exception as e:
-            error_str = str(e).upper()
-            
-            # Catch both Rate Limits (429) AND Server Overloads (503/500/502)
-            if any(code in error_str for code in ["429", "503", "500", "502", "RESOURCE_EXHAUSTED", "UNAVAILABLE"]):
-                # Exponential backoff with jitter to avoid slamming the server
-                wait_time = (base_wait_time ** attempt) + random.uniform(0, 3)
-                
-                # Cap the maximum wait time to 60 seconds
-                wait_time = min(wait_time, 60.0) 
-                
-                print(f"  [API Error] {error_str[:60]}... Waiting {wait_time:.1f}s before retry ({attempt + 1}/{max_retries})...")
-                await asyncio.sleep(wait_time)
+            err = str(e)
+            if "ConnectError" in err or "429" in err or "RESOURCE_EXHAUSTED" in err:
+                wait = 30 * (attempt + 1)  # 30s, 60s, 90s...
+                print(f"  network/rate error — waiting {wait}s (attempt {attempt+1}/{max_retries})")
+                await asyncio.sleep(wait)
             else:
-                # If it's a completely different error (like a syntax error in the code), crash normally
                 raise e
-    
-    return "Agent failed due to repeated API errors."
+    return ""
 
 async def main():
     await init_session(APP_NAME, USER_ID, SESSION_ID)

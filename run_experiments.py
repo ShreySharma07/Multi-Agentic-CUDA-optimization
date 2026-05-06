@@ -12,6 +12,12 @@ from pipeline.pre_flight import pre_flight
 from pipeline.validator import run_validation
 from Agents.coder import safe_chat, runner, USER_ID, SESSION_ID
 
+from knowledgeBase.store import KnowledgeBase
+from knowledgeBase.reflector import reflect
+
+# initialize once at module level
+kb = KnowledgeBase()
+
 
 from pydantic import BaseModel
 from typing import Optional
@@ -151,6 +157,23 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         print(f"  baseline: {baseline_ms:.3f}ms")
     else:
         print("  baseline compile failed — speedup will be 0")
+    
+    # after pre-flight, before the for loop
+    kb_results = kb.retrieve(bottleneck=hint, kernel_name=name)
+    kb_ctx = ""
+    if kb_results:
+        kb_ctx = "Relevant past optimizations from KnowledgeBase:\n"
+        for past in kb_results:
+            kb_ctx += (
+                f"  - On a {past.get('bottleneck','?')} kernel: "
+                f"{past.get('strategy_used','?')} → "
+                f"{past.get('speedup',0):.2f}x speedup. "
+                f"Insight: {past.get('insight','?')}\n"
+            )
+        kb_ctx += "\n"
+        print(f"  KB: found {len(kb_results)} relevant past optimizations")
+    else:
+        print(f"  KB: no relevant history yet (KB has {kb.count()} total entries)")
 
     # ── optimization loop ──────────────────────────────────────────────
     best_speedup = None
@@ -193,6 +216,13 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         }.get(hint, "")
 
         prompt = (
+            f"You are a CUDA expert optimizing for RTX A4000 ({GPU_ARCH} Ampere).\n"
+            f"Round {r} of {ROUNDS}.\n\n"
+            f"{metrics_ctx}"
+            f"{kb_ctx}"          # ← add this
+            f"Optimization hint: {strategy_hint}\n\n"
+            f"{history_ctx}"
+            f"{best_ctx}"
             f"You are a CUDA expert optimizing for RTX A4000 ({GPU_ARCH} Ampere).\n"
             f"Round {r} of {ROUNDS}.\n\n"
             f"{metrics_ctx}"
@@ -284,12 +314,26 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             if abs(curr - prev) < 0.01:
                 print("  converged — stopping early")
                 break
+        
 
     n_compile = sum(1 for h in history if h["result"] == "compile_failed")
     n_val     = sum(1 for h in history if h["result"] == "validation_failed")
     # replace the print at the end
     print(f"\n  RESULT: best={'%.4f' % best_speedup if best_speedup else 'None'}x  "
       f"round={best_round}  compile_fails={n_compile}  val_fails={n_val}")
+    
+    # after determining result (success/fail), add:
+    insight = await reflect(
+        kernel_name=name,
+        bottleneck=hint,
+        round_num=r,
+        code=optimized,
+        result="success" if (ok and val_ok) else ("compile_failed" if not ok else "validation_failed"),
+        speedup=speedup if (ok and val_ok) else 0.0,
+        error=err if not ok else (str(val_msg) if not val_ok else ""),
+    )
+    kb.store(insight)
+    print(f"  KB: stored insight → {insight['strategy_used'][:60]}")
 
     result = ExperimentResult(
     timestamp=datetime.now().isoformat(),
@@ -372,10 +416,11 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
             f"PYTORCH REFERENCE:\n{pytorch_code}\n\n"
             f"REQUIREMENTS:\n"
             f"- Complete standalone .cu file with main()\n"
-            f"- main() allocates data, runs kernel, compares to CPU, prints 'GPU Time: X ms'\n"
-            f"- Prints 'SUCCESS' if GPU and CPU outputs match (tolerance 1e-4), else 'FAILURE'\n"
-            f"- float32 only\n"
-            f"- Start with #include, no markdown, no backticks\n"
+            f"- main() MUST print exactly: GPU Time: X ms  (where X is a float)\n"
+            f"- Example: printf(\"GPU Time: %.6f ms\\n\", elapsed_ms);\n"
+            f"- Use cudaEvent_t for timing (cudaEventRecord, cudaEventElapsedTime)\n"
+            f"- Compare GPU output to CPU, print SUCCESS or FAILURE\n"
+            f"- float32 only, no markdown, start with #include\n"
             f"- Must compile: nvcc -O2 -arch=sm_86\n"
         )
 
