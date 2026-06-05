@@ -14,6 +14,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from pathlib import Path
 import asyncio, json, re, subprocess
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -533,6 +536,10 @@ async def kernels_list():
 @app.get("/")
 async def root():
     return FileResponse("index.html")
+
+@app.get("/KARMA.html")
+async def agent_page():
+    return FileResponse("KARMA.html")
 
 if __name__ == "__main__":
     import uvicorn

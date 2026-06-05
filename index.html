@@ -3,696 +3,1055 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>KARMA — Kernel Optimizer</title>
+<title>KARMA — Kernel-Aware Retrieval Memory Agents</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 :root {
-  --bg:#0a0b0d;--bg2:#0f1114;--bg3:#151719;
-  --border:#1e2124;--border2:#2a2d32;
-  --green:#00e5a0;--green-dim:#00e5a020;--green-mid:#00e5a040;
-  --amber:#f5a623;--amber-dim:#f5a62318;--red:#ff4d6a;--blue:#4d9fff;
-  --text:#c8cdd4;--text-dim:#5a6170;--text-mid:#8892a0;
-  --mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif;
+  --bg:       #020508;
+  --cyan:     #00d4ff;
+  --cyan-dim: rgba(0,212,255,0.08);
+  --cyan-mid: rgba(0,212,255,0.25);
+  --cyan-glow:rgba(0,212,255,0.5);
+  --green:    #00e5a0;
+  --green-dim:rgba(0,229,160,0.08);
+  --green-mid:rgba(0,229,160,0.25);
+  --amber:    #ffb03a;
+  --border:   rgba(0,212,255,0.08);
+  --border2:  rgba(0,212,255,0.15);
+  --text:     #e8f4ff;
+  --text-dim: rgba(232,244,255,0.45);
+  --text-mid: rgba(232,244,255,0.7);
+  --mono:     'JetBrains Mono', monospace;
+  --sans:     'Space Grotesk', sans-serif;
 }
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:var(--mono);height:100vh;display:flex;flex-direction:column;overflow:hidden}
-header{display:flex;align-items:center;justify-content:space-between;padding:0 24px;height:52px;border-bottom:1px solid var(--border);background:var(--bg2);flex-shrink:0}
-.logo{display:flex;align-items:center;gap:12px}
-.logo-mark{width:28px;height:28px;border:1.5px solid var(--green);display:flex;align-items:center;justify-content:center;position:relative}
-.logo-mark::before{content:'';width:8px;height:8px;background:var(--green);animation:pulse 2s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.7)}}
-.logo-text{font-size:13px;font-weight:600;letter-spacing:.15em;color:var(--green)}
-.logo-sub{font-size:10px;color:var(--text-dim);letter-spacing:.08em;font-weight:300}
-.header-right{display:flex;align-items:center;gap:16px}
-.status-pill{display:flex;align-items:center;gap:6px;font-size:10px;color:var(--text-dim);letter-spacing:.06em}
-.status-dot{width:6px;height:6px;border-radius:50%;background:var(--green);animation:pulse 2s ease-in-out infinite}
-.status-dot.offline{background:var(--red);animation:none}
-.status-dot.thinking{background:var(--amber)}
-.gpu-info{font-size:10px;color:var(--text-dim);border:1px solid var(--border2);padding:3px 10px;letter-spacing:.04em}
-.workspace{display:flex;flex:1;overflow:hidden}
-.sidebar{width:220px;border-right:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden}
-.sidebar-section{padding:14px 16px;border-bottom:1px solid var(--border)}
-.sidebar-label{font-size:9px;letter-spacing:.12em;color:var(--text-dim);margin-bottom:10px;font-weight:500}
-.quick-cmd{display:flex;align-items:center;gap:8px;padding:7px 10px;font-size:11px;color:var(--text-mid);cursor:pointer;border:1px solid transparent;margin-bottom:3px;transition:all .15s;font-family:var(--mono);background:none;width:100%;text-align:left}
-.quick-cmd:hover{background:var(--green-dim);border-color:var(--green-mid);color:var(--green)}
-.cmd-icon{font-size:9px;opacity:.5;flex-shrink:0}
-.cmd-text{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.metrics-grid{display:grid;gap:8px}
-.metric-item{display:flex;justify-content:space-between;align-items:center}
-.metric-label{font-size:10px;color:var(--text-dim)}
-.metric-value{font-size:11px;font-weight:500;color:var(--green)}
-.metric-value.amber{color:var(--amber)}
-.metric-value.neutral{color:var(--text-mid)}
-.sidebar-spacer{flex:1}
-.model-switcher{padding:12px 16px;border-top:1px solid var(--border)}
-.model-select{width:100%;background:var(--bg3);border:1px solid var(--border2);color:var(--text-mid);font-family:var(--mono);font-size:10px;padding:6px 8px;cursor:pointer;outline:none;letter-spacing:.03em}
-.model-select:focus{border-color:var(--green-mid)}
-.chat-area{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--bg)}
-.messages{flex:1;overflow-y:auto;padding:24px;display:flex;flex-direction:column;gap:0;scroll-behavior:smooth}
-.messages::-webkit-scrollbar{width:4px}
-.messages::-webkit-scrollbar-thumb{background:var(--border2)}
-.welcome{margin:auto;text-align:center;max-width:420px;padding:40px 0}
-.welcome-ascii{font-size:10px;line-height:1.4;color:var(--green);margin-bottom:24px;opacity:.6;white-space:pre}
-.welcome-title{font-size:20px;font-weight:600;color:var(--text);letter-spacing:.05em;margin-bottom:8px}
-.welcome-sub{font-size:12px;color:var(--text-dim);line-height:1.7;font-family:var(--sans);font-weight:300;margin-bottom:28px}
-.welcome-chips{display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
-.chip{font-size:11px;border:1px solid var(--border2);padding:6px 12px;color:var(--text-mid);cursor:pointer;transition:all .15s;font-family:var(--mono);background:none}
-.chip:hover{border-color:var(--green-mid);color:var(--green);background:var(--green-dim)}
-.msg{display:flex;gap:14px;padding:16px 0;border-bottom:1px solid var(--border);animation:fadeIn .2s ease}
-@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
-.msg:last-child{border-bottom:none}
-.msg-avatar{width:28px;height:28px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:600;letter-spacing:.05em;margin-top:2px}
-.msg-avatar.user{border:1px solid var(--border2);color:var(--text-dim)}
-.msg-avatar.agent{border:1px solid var(--green-mid);color:var(--green);background:var(--green-dim)}
-.msg-avatar.error{border:1px solid var(--red);color:var(--red)}
-.msg-body{flex:1;min-width:0}
-.msg-meta{display:flex;align-items:center;gap:10px;margin-bottom:6px}
-.msg-author{font-size:10px;font-weight:600;letter-spacing:.08em;color:var(--text-mid)}
-.msg-author.agent{color:var(--green)}
-.msg-author.error{color:var(--red)}
-.msg-time{font-size:9px;color:var(--text-dim)}
-.msg-content{font-size:13px;line-height:1.7;color:var(--text);font-family:var(--sans);font-weight:300}
-.msg-content p{margin-bottom:10px}
-.msg-content p:last-child{margin-bottom:0}
-.msg-content strong{font-family:var(--mono);font-weight:500;color:var(--text);font-size:12px}
-.msg-content pre{background:var(--bg3);border:1px solid var(--border2);border-left:2px solid var(--green);padding:14px 16px;overflow-x:auto;margin:10px 0;position:relative}
-.msg-content code{font-family:var(--mono);font-size:12px;color:#a8d8a8;line-height:1.6}
-.msg-content :not(pre)>code{background:var(--bg3);border:1px solid var(--border2);padding:1px 5px;font-size:11px;color:var(--amber)}
-.copy-btn{position:absolute;top:8px;right:8px;background:none;border:1px solid var(--border2);color:var(--text-dim);font-family:var(--mono);font-size:9px;padding:3px 7px;cursor:pointer;letter-spacing:.05em;transition:all .15s}
-.copy-btn:hover{border-color:var(--green-mid);color:var(--green)}
-.lang-tag{position:absolute;top:8px;left:14px;font-size:9px;color:var(--text-dim);letter-spacing:.08em}
-.thinking-msg .msg-content{display:flex;align-items:center;gap:10px;color:var(--text-dim);font-size:12px;font-family:var(--mono)}
-.thinking-dots{display:flex;gap:4px}
-.thinking-dots span{width:4px;height:4px;background:var(--green);border-radius:50%;animation:dot 1.2s ease-in-out infinite}
-.thinking-dots span:nth-child(2){animation-delay:.2s}
-.thinking-dots span:nth-child(3){animation-delay:.4s}
-@keyframes dot{0%,80%,100%{opacity:.2;transform:scale(.8)}40%{opacity:1;transform:scale(1)}}
-/* action buttons inside messages */
-.msg-action-row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
-.msg-action{background:none;border:1px solid var(--border2);color:var(--text-mid);font-family:var(--mono);font-size:10px;padding:5px 12px;cursor:pointer;transition:all .15s;letter-spacing:.04em}
-.msg-action:hover{border-color:var(--green-mid);color:var(--green);background:var(--green-dim)}
-.msg-action.primary{border-color:var(--green-mid);color:var(--green);background:var(--green-dim)}
-/* kernel list buttons */
-.kernel-btn{display:flex;align-items:center;gap:10px;width:100%;background:var(--bg3);border:1px solid var(--border2);color:var(--text-mid);font-family:var(--mono);font-size:11px;padding:8px 12px;cursor:pointer;margin-bottom:5px;text-align:left;transition:all .15s}
-.kernel-btn:hover{border-color:var(--green-mid);color:var(--green)}
-.kernel-btn .kb-icon{color:var(--green);font-size:9px}
-.kernel-btn .kb-actions{margin-left:auto;display:flex;gap:6px}
-.kernel-btn .kb-act{font-size:9px;padding:2px 7px;border:1px solid var(--border2);color:var(--text-dim);background:none;cursor:pointer;font-family:var(--mono)}
-.kernel-btn .kb-act:hover{border-color:var(--green-mid);color:var(--green)}
-/* input area */
-.input-area{padding:16px 24px 20px;border-top:1px solid var(--border);background:var(--bg2);flex-shrink:0}
-.input-row{display:flex;gap:10px;align-items:flex-end}
-.input-wrap{flex:1;position:relative;background:var(--bg3);border:1px solid var(--border2);transition:border-color .15s}
-.input-wrap:focus-within{border-color:var(--green-mid)}
-.input-prefix{position:absolute;left:14px;top:14px;font-size:12px;color:var(--green);pointer-events:none;font-weight:500}
-textarea{width:100%;background:transparent;border:none;outline:none;color:var(--text);font-family:var(--mono);font-size:13px;padding:12px 14px 12px 34px;resize:none;min-height:46px;max-height:180px;line-height:1.5}
-textarea::placeholder{color:var(--text-dim)}
-.send-btn{width:46px;height:46px;background:var(--green);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:all .15s}
-.send-btn:hover{background:#00ffa8}
-.send-btn:active{transform:scale(.96)}
-.send-btn:disabled{background:var(--border2);cursor:not-allowed}
-.send-btn svg{width:16px;height:16px}
-.input-hint{font-size:9px;color:var(--text-dim);margin-top:8px;letter-spacing:.04em}
-.input-hint kbd{border:1px solid var(--border2);padding:1px 4px;font-family:var(--mono);font-size:9px}
-/* optimization panel */
-.opt-panel{width:0;border-left:1px solid var(--border);background:var(--bg2);display:flex;flex-direction:column;flex-shrink:0;overflow:hidden;transition:width .3s ease}
-.opt-panel.open{width:340px}
-.opt-header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
-.opt-title{font-size:11px;font-weight:600;color:var(--green);letter-spacing:.08em}
-.opt-kernel{font-size:10px;color:var(--text-dim);margin-top:2px}
-.opt-close{background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:14px;padding:2px 6px;font-family:var(--mono)}
-.opt-close:hover{color:var(--text)}
-.opt-body{flex:1;overflow-y:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
-.opt-body::-webkit-scrollbar{width:3px}
-.opt-body::-webkit-scrollbar-thumb{background:var(--border2)}
-.opt-progress-wrap{}
-.opt-progress-label{font-size:9px;color:var(--text-dim);letter-spacing:.1em;margin-bottom:6px;display:flex;justify-content:space-between}
-.opt-progress-bar{height:2px;background:var(--border)}
-.opt-progress-fill{height:100%;background:var(--green);transition:width .4s ease;width:0%}
-.opt-pills{display:flex;flex-wrap:wrap;gap:5px}
-.opt-pill{font-size:9px;padding:3px 9px;border:1px solid var(--border2);color:var(--text-dim);letter-spacing:.04em;transition:all .2s}
-.opt-pill.active{border-color:#f5a62360;color:var(--amber);background:#f5a62310}
-.opt-pill.ok{border-color:#00e5a040;color:var(--green);background:#00e5a010}
-.opt-pill.fail{border-color:#ff4d6a40;color:var(--red);background:#ff4d6a10}
-.opt-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.opt-stat{background:var(--bg3);border:1px solid var(--border);padding:10px 12px}
-.opt-stat-label{font-size:9px;color:var(--text-dim);letter-spacing:.08em;margin-bottom:4px}
-.opt-stat-value{font-size:20px;font-weight:600;color:var(--green);line-height:1}
-.opt-stat-value.amber{color:var(--amber)}
-.opt-stat-value.dim{color:var(--text-mid)}
-.opt-stat-sub{font-size:9px;color:var(--text-dim);margin-top:3px}
-.opt-metrics-box{background:var(--bg3);border:1px solid var(--border);padding:10px 12px}
-.opt-metrics-label{font-size:9px;color:var(--text-dim);letter-spacing:.08em;margin-bottom:8px}
-.opt-metric-row{display:flex;justify-content:space-between;font-size:10px;margin-bottom:5px}
-.opt-metric-key{color:var(--text-dim)}
-.opt-metric-val{color:var(--amber);font-weight:500}
-.opt-chart-wrap{background:var(--bg3);border:1px solid var(--border);padding:12px}
-.opt-chart-label{font-size:9px;color:var(--text-dim);letter-spacing:.08em;margin-bottom:8px}
-.opt-chart svg{width:100%;height:90px;display:block}
-.opt-complete{background:#00e5a015;border:1px solid #00e5a040;padding:12px 14px;display:none}
-.opt-complete.show{display:block}
-.opt-complete-title{font-size:11px;color:var(--green);font-weight:600;margin-bottom:4px}
-.opt-complete-sub{font-size:10px;color:var(--text-dim)}
-.opt-log{background:var(--bg3);border:1px solid var(--border);padding:10px 12px;flex:1;min-height:120px}
-.opt-log-label{font-size:9px;color:var(--text-dim);letter-spacing:.08em;margin-bottom:8px}
-.opt-log-entries{overflow-y:auto;max-height:200px}
-.opt-log-entries::-webkit-scrollbar{width:2px}
-.opt-log-entries::-webkit-scrollbar-thumb{background:var(--border2)}
-.opt-log-row{display:flex;gap:8px;font-size:10px;line-height:1.8}
-.opt-log-t{color:var(--text-dim);flex-shrink:0;font-size:9px}
-.opt-log-msg{color:var(--text-mid)}
-.opt-log-msg.ok{color:var(--green)}
-.opt-log-msg.fail{color:var(--red)}
-.opt-log-msg.info{color:var(--amber)}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  overflow-x: hidden;
+  line-height: 1.6;
+}
+
+/* ── GRID BACKGROUND ── */
+.bg-grid {
+  position: fixed;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(0,212,255,0.04) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,212,255,0.04) 1px, transparent 1px);
+  background-size: 48px 48px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.bg-radial {
+  position: fixed;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 70% 50% at 50% -10%, rgba(0,212,255,0.12) 0%, transparent 60%),
+    radial-gradient(ellipse 40% 40% at 90% 80%, rgba(0,229,160,0.06) 0%, transparent 50%),
+    radial-gradient(ellipse 50% 40% at 10% 60%, rgba(0,212,255,0.05) 0%, transparent 50%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+/* ── NAV ── */
+nav {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  z-index: 100;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 48px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(2,5,8,0.8);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.nav-logo {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  text-decoration: none;
+}
+
+.nav-hex {
+  width: 32px; height: 32px;
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+.nav-hex svg {
+  position: absolute; width: 100%; height: 100%;
+  animation: hexspin 10s linear infinite;
+}
+@keyframes hexspin {
+  to { transform: rotate(360deg); }
+}
+.nav-hex-core {
+  width: 12px; height: 12px;
+  background: linear-gradient(135deg, var(--cyan), var(--green));
+  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
+  box-shadow: 0 0 10px var(--cyan-glow);
+  position: relative; z-index: 1;
+  animation: corePulse 2s ease-in-out infinite;
+}
+@keyframes corePulse {
+  0%,100% { opacity:1; transform:scale(1); }
+  50%      { opacity:0.6; transform:scale(0.8); }
+}
+
+.nav-wordmark {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  color: var(--cyan);
+  text-shadow: 0 0 20px var(--cyan-glow);
+}
+
+.nav-links {
+  display: flex;
+  align-items: center;
+  gap: 32px;
+  list-style: none;
+}
+.nav-links a {
+  font-size: 13px;
+  color: var(--text-dim);
+  text-decoration: none;
+  letter-spacing: 0.04em;
+  transition: color 0.2s;
+  font-family: var(--mono);
+}
+.nav-links a:hover { color: var(--text); }
+
+.nav-cta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.btn-ghost {
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  text-decoration: none;
+  letter-spacing: 0.06em;
+  transition: color 0.2s;
+  padding: 6px 0;
+}
+.btn-ghost:hover { color: var(--cyan); }
+
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-family: var(--mono);
+  letter-spacing: 0.08em;
+  font-weight: 500;
+  color: #000;
+  background: linear-gradient(135deg, var(--cyan), #00a8d4);
+  padding: 8px 18px;
+  text-decoration: none;
+  clip-path: polygon(6px 0%, 100% 0%, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0% 100%, 0% 6px);
+  transition: all 0.2s;
+  box-shadow: 0 0 16px var(--cyan-mid);
+}
+.btn-primary:hover {
+  background: linear-gradient(135deg, #20e8ff, var(--cyan));
+  box-shadow: 0 0 28px var(--cyan-glow);
+  transform: translateY(-1px);
+}
+.btn-primary .arrow { transition: transform 0.2s; }
+.btn-primary:hover .arrow { transform: translateX(3px); }
+
+/* ── HERO ── */
+.hero {
+  position: relative;
+  z-index: 1;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 120px 48px 80px;
+}
+
+.hero-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10px;
+  font-family: var(--mono);
+  letter-spacing: 0.2em;
+  color: var(--cyan);
+  border: 1px solid var(--border2);
+  padding: 5px 14px;
+  margin-bottom: 40px;
+  background: var(--cyan-dim);
+}
+.hero-eyebrow-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-glow);
+  animation: corePulse 2s ease-in-out infinite;
+}
+
+.hero-title {
+  font-size: clamp(48px, 7vw, 96px);
+  font-weight: 300;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  max-width: 900px;
+  margin-bottom: 28px;
+  color: rgba(232,244,255,0.9);
+  text-wrap: balance;
+}
+.hero-title .accent {
+  color: var(--cyan);
+  text-shadow: 0 0 40px rgba(0,212,255,0.4);
+}
+.hero-title .accent-green {
+  color: var(--green);
+  text-shadow: 0 0 40px rgba(0,229,160,0.3);
+}
+
+.hero-sub {
+  font-size: clamp(15px, 1.8vw, 18px);
+  color: var(--text-dim);
+  max-width: 520px;
+  margin-bottom: 48px;
+  font-weight: 300;
+  line-height: 1.75;
+}
+
+.hero-ctas {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-bottom: 80px;
+}
+
+.btn-hero-primary {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  font-weight: 500;
+  color: #000;
+  background: linear-gradient(135deg, var(--cyan), #00a8d4);
+  padding: 14px 28px;
+  text-decoration: none;
+  clip-path: polygon(8px 0%, 100% 0%, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0% 100%, 0% 8px);
+  transition: all 0.25s;
+  box-shadow: 0 0 24px var(--cyan-mid), 0 4px 20px rgba(0,0,0,0.4);
+}
+.btn-hero-primary:hover {
+  box-shadow: 0 0 40px var(--cyan-glow), 0 4px 20px rgba(0,0,0,0.4);
+  transform: translateY(-2px);
+}
+.btn-hero-primary .arrow { transition: transform 0.2s; }
+.btn-hero-primary:hover .arrow { transform: translateX(4px); }
+
+.btn-hero-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  color: var(--text-mid);
+  text-decoration: none;
+  padding: 14px 28px;
+  border: 1px solid var(--border2);
+  transition: all 0.25s;
+  background: rgba(0,212,255,0.03);
+}
+.btn-hero-ghost:hover {
+  border-color: var(--cyan-mid);
+  color: var(--cyan);
+  background: var(--cyan-dim);
+  transform: translateY(-2px);
+}
+
+/* ── TRUSTED BY ── */
+.hero-trusted {
+  font-size: 10px;
+  font-family: var(--mono);
+  letter-spacing: 0.16em;
+  color: var(--text-dim);
+  margin-bottom: 20px;
+}
+.hero-trusted-logos {
+  display: flex;
+  align-items: center;
+  gap: 40px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.trusted-logo {
+  font-size: 11px;
+  font-family: var(--mono);
+  letter-spacing: 0.1em;
+  color: rgba(232,244,255,0.2);
+  font-weight: 500;
+  transition: color 0.2s;
+}
+.trusted-logo:hover { color: rgba(232,244,255,0.4); }
+
+/* ── HERO VISUAL ── */
+.hero-visual {
+  position: absolute;
+  right: 80px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 420px;
+  height: 420px;
+  pointer-events: none;
+  opacity: 0.6;
+}
+
+/* ── STATS BAR ── */
+.stats-bar {
+  position: relative;
+  z-index: 1;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: rgba(0,212,255,0.02);
+  padding: 32px 48px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 0 60px;
+  border-right: 1px solid var(--border);
+}
+.stat-item:last-child { border-right: none; }
+
+.stat-value {
+  font-size: 36px;
+  font-weight: 600;
+  color: var(--cyan);
+  text-shadow: 0 0 20px var(--cyan-glow);
+  font-family: var(--sans);
+  letter-spacing: -0.02em;
+  line-height: 1;
+}
+.stat-value.green { color: var(--green); text-shadow: 0 0 20px rgba(0,229,160,0.5); }
+.stat-value.amber { color: var(--amber); text-shadow: 0 0 20px rgba(255,176,58,0.4); }
+.stat-label {
+  font-size: 10px;
+  font-family: var(--mono);
+  letter-spacing: 0.14em;
+  color: var(--text-dim);
+}
+
+/* ── SECTION ── */
+section {
+  position: relative;
+  z-index: 1;
+  padding: 100px 48px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.section-eyebrow {
+  font-size: 9px;
+  font-family: var(--mono);
+  letter-spacing: 0.2em;
+  color: var(--cyan);
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.section-eyebrow::before {
+  content: '';
+  width: 24px; height: 1px;
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan-glow);
+}
+
+.section-title {
+  font-size: clamp(36px, 4vw, 56px);
+  font-weight: 300;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--text);
+  max-width: 600px;
+  margin-bottom: 16px;
+  text-wrap: balance;
+}
+.section-title .accent { color: var(--cyan); }
+.section-title .accent-green { color: var(--green); }
+
+.section-sub {
+  font-size: 15px;
+  color: var(--text-dim);
+  max-width: 480px;
+  margin-bottom: 56px;
+  line-height: 1.75;
+  font-weight: 300;
+}
+
+/* ── PIPELINE STEPS ── */
+.pipeline {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  margin-bottom: 24px;
+}
+
+.pipeline-step {
+  background: rgba(2,5,8,0.95);
+  padding: 36px 32px;
+  position: relative;
+  transition: background 0.3s;
+  overflow: hidden;
+}
+.pipeline-step::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--cyan-mid), transparent);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.pipeline-step:hover { background: rgba(0,212,255,0.04); }
+.pipeline-step:hover::before { opacity: 1; }
+
+.step-num {
+  font-size: 9px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  letter-spacing: 0.14em;
+  margin-bottom: 20px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.step-num-badge {
+  width: 22px; height: 22px;
+  border: 1px solid var(--border2);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 9px;
+  color: var(--cyan);
+  font-family: var(--mono);
+}
+
+.step-icon {
+  width: 40px; height: 40px;
+  margin-bottom: 20px;
+  color: var(--cyan);
+  opacity: 0.8;
+}
+
+.step-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 10px;
+  letter-spacing: -0.01em;
+}
+.step-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.7;
+  font-weight: 300;
+}
+
+.step-tag {
+  display: inline-block;
+  margin-top: 16px;
+  font-size: 9px;
+  font-family: var(--mono);
+  letter-spacing: 0.1em;
+  color: var(--cyan);
+  border: 1px solid var(--border2);
+  padding: 3px 8px;
+  background: var(--cyan-dim);
+}
+
+/* ── AGENTS GRID ── */
+.agents-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 16px;
+}
+
+.agent-card {
+  background: rgba(0,212,255,0.02);
+  border: 1px solid var(--border);
+  padding: 28px 28px 24px;
+  position: relative;
+  overflow: hidden;
+  transition: all 0.3s;
+}
+.agent-card:hover {
+  border-color: var(--border2);
+  background: rgba(0,212,255,0.05);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3), 0 0 20px rgba(0,212,255,0.05);
+}
+.agent-card::after {
+  content: '';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--cyan-mid), transparent);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.agent-card:hover::after { opacity: 1; }
+
+.agent-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.agent-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.agent-id {
+  font-size: 8px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  padding: 2px 6px;
+  letter-spacing: 0.08em;
+}
+.agent-desc {
+  font-size: 13px;
+  color: var(--text-dim);
+  line-height: 1.7;
+  font-weight: 300;
+  margin-bottom: 16px;
+}
+.agent-tags {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.agent-tag {
+  font-size: 9px;
+  font-family: var(--mono);
+  letter-spacing: 0.08em;
+  padding: 2px 7px;
+  border: 1px solid rgba(0,229,160,0.2);
+  color: var(--green);
+  background: rgba(0,229,160,0.05);
+}
+
+/* ── FULL WIDTH SECTION ── */
+.section-full {
+  position: relative;
+  z-index: 1;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: rgba(0,212,255,0.015);
+  padding: 100px 48px;
+  text-align: center;
+}
+
+.section-full-inner {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+.section-full-title {
+  font-size: clamp(40px, 5vw, 72px);
+  font-weight: 300;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  color: rgba(232,244,255,0.75);
+  margin-bottom: 12px;
+  text-wrap: balance;
+}
+.section-full-title .highlight {
+  color: var(--text);
+  text-shadow: 0 0 30px rgba(232,244,255,0.15);
+}
+
+/* ── TERMINAL DEMO ── */
+.terminal {
+  background: rgba(6,10,18,0.95);
+  border: 1px solid var(--border2);
+  border-left: 2px solid var(--cyan);
+  padding: 20px 24px;
+  box-shadow: 0 0 40px rgba(0,212,255,0.05), inset 0 0 20px rgba(0,0,0,0.3);
+  margin-top: 40px;
+  text-align: left;
+  max-width: 700px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.terminal-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.terminal-dot { width: 8px; height: 8px; border-radius: 50%; }
+.terminal-dot.red { background: #ff5f57; }
+.terminal-dot.amber { background: #ffbd2e; }
+.terminal-dot.green { background: #28c840; }
+.terminal-title {
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+  margin-left: 8px;
+}
+.terminal-line {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.9;
+  color: var(--text-mid);
+}
+.terminal-line .prompt { color: var(--cyan); }
+.terminal-line .cmd { color: var(--text); }
+.terminal-line .output { color: rgba(232,244,255,0.4); }
+.terminal-line .ok { color: var(--green); }
+.terminal-line .warn { color: var(--amber); }
+.terminal-line .dim { color: var(--text-dim); }
+.terminal-cursor {
+  display: inline-block;
+  width: 8px; height: 13px;
+  background: var(--cyan);
+  vertical-align: middle;
+  animation: blink 1.2s step-end infinite;
+  margin-left: 2px;
+  box-shadow: 0 0 6px var(--cyan-glow);
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+/* ── FOOTER ── */
+footer {
+  position: relative;
+  z-index: 1;
+  border-top: 1px solid var(--border);
+  padding: 40px 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.footer-logo {
+  display: flex; align-items: center; gap: 10px;
+}
+.footer-wordmark {
+  font-size: 13px; font-weight: 700;
+  letter-spacing: 0.15em; color: var(--text-dim);
+  font-family: var(--sans);
+}
+.footer-right {
+  font-size: 10px; font-family: var(--mono);
+  color: var(--text-dim); letter-spacing: 0.06em;
+}
+.footer-right a { color: var(--text-dim); text-decoration: none; transition: color 0.2s; }
+.footer-right a:hover { color: var(--cyan); }
+
+/* ── SCROLL FADE IN ── */
+.fade-up {
+  opacity: 0;
+  transform: translateY(24px);
+  transition: opacity 0.6s ease, transform 0.6s ease;
+}
+.fade-up.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
 </style>
 </head>
 <body>
 
-<header>
-  <div class="logo">
-    <div class="logo-mark"></div>
-    <div>
-      <div class="logo-text">KARMA</div>
-      <div class="logo-sub">Kernel-Aware Retrieval Memory Agents</div>
+<div class="bg-grid"></div>
+<div class="bg-radial"></div>
+
+<!-- ── NAV ── -->
+<nav>
+  <a href="index.html" class="nav-logo">
+    <div class="nav-hex">
+      <svg viewBox="0 0 32 32" fill="none">
+        <polygon points="16,2 30,9 30,23 16,30 2,23 2,9" stroke="#00d4ff" stroke-width="0.8" stroke-dasharray="3 2" opacity="0.7"/>
+      </svg>
+      <div class="nav-hex-core"></div>
     </div>
+    <span class="nav-wordmark">KARMA</span>
+  </a>
+
+  <ul class="nav-links">
+    <li><a href="#pipeline">Pipeline</a></li>
+    <li><a href="#agents">Agents</a></li>
+    <li><a href="#demo">Demo</a></li>
+  </ul>
+
+  <div class="nav-cta">
+    <a href="#" class="btn-ghost">Documentation →</a>
+    <a href="KARMA.html" class="btn-primary">Launch Agent <span class="arrow">→</span></a>
   </div>
-  <div class="header-right">
-    <div class="status-pill">
-      <div class="status-dot" id="statusDot"></div>
-      <span id="statusText">connecting...</span>
-    </div>
-    <div class="gpu-info" id="gpuInfo">detecting GPU...</div>
-  </div>
-</header>
+</nav>
 
-<div class="workspace">
-  <aside class="sidebar">
-    <div class="sidebar-section">
-      <div class="sidebar-label">QUICK ACTIONS</div>
-      <button class="quick-cmd" onclick="sendQuick('list kernels')">
-        <span class="cmd-icon">▸</span><span class="cmd-text">list kernels</span>
-      </button>
-      <button class="quick-cmd" onclick="sendQuick('analyze sigmoid_kernel.cu')">
-        <span class="cmd-icon">▸</span><span class="cmd-text">analyze sigmoid</span>
-      </button>
-      <button class="quick-cmd" onclick="sendQuick('optimize sigmoid_kernel.cu')">
-        <span class="cmd-icon">▸</span><span class="cmd-text">optimize sigmoid</span>
-      </button>
-      <button class="quick-cmd" onclick="sendQuick('analyze vector_add.cu')">
-        <span class="cmd-icon">▸</span><span class="cmd-text">analyze vector_add</span>
-      </button>
-      <button class="quick-cmd" onclick="sendQuick('optimize vector_add.cu')">
-        <span class="cmd-icon">▸</span><span class="cmd-text">optimize vector_add</span>
-      </button>
-    </div>
-    <div class="sidebar-section">
-      <div class="sidebar-label">SESSION METRICS</div>
-      <div class="metrics-grid">
-        <div class="metric-item"><span class="metric-label">kernels processed</span><span class="metric-value neutral" id="metricKernels">0</span></div>
-        <div class="metric-item"><span class="metric-label">best speedup</span><span class="metric-value" id="metricSpeedup">—</span></div>
-        <div class="metric-item"><span class="metric-label">compile passes</span><span class="metric-value" id="metricPasses">0</span></div>
-        <div class="metric-item"><span class="metric-label">validations passed</span><span class="metric-value neutral" id="metricValidations">0</span></div>
-      </div>
-    </div>
-    <div class="sidebar-spacer"></div>
-    <div class="model-switcher">
-      <div class="sidebar-label" style="margin-bottom:6px">ACTIVE MODEL</div>
-      <select class="model-select" id="modelSelect" onchange="updateModel(this.value)">
-        <option value="gemini-2.0-flash">gemini-2.0-flash</option>
-        <option value="gemini-2.5-pro-preview-05-06">gemini-2.5-pro</option>
-        <option value="claude-sonnet-4-6">claude-sonnet-4-6</option>
-        <option value="claude-opus-4-6">claude-opus-4-6</option>
-      </select>
-      <div style="font-size:9px;color:var(--text-dim);margin-top:6px" id="modelNote">chat agent model</div>
-    </div>
-  </aside>
-
-  <div class="chat-area">
-    <div class="messages" id="messages">
-      <div class="welcome" id="welcome">
-        <div class="welcome-ascii">╔═══════════════════════════╗
-║  K A R M A  v0.2.0        ║
-╚═══════════════════════════╝</div>
-        <div class="welcome-title">CUDA Optimization Agent</div>
-        <div class="welcome-sub">
-          Start a conversation — pick a kernel, analyze its bottlenecks,<br>
-          then run the optimization loop from right here in chat.
-        </div>
-        <div class="welcome-chips">
-          <button class="chip" onclick="sendQuick('list kernels')">list kernels</button>
-          <button class="chip" onclick="sendQuick('analyze sigmoid_kernel.cu')">analyze sigmoid</button>
-          <button class="chip" onclick="sendQuick('optimize vector_add.cu')">optimize vector_add</button>
-          <button class="chip" onclick="sendQuick('how does KARMA work')">how it works</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="input-area">
-      <div class="input-row">
-        <div class="input-wrap">
-          <span class="input-prefix">›</span>
-          <textarea id="userInput" placeholder="list kernels · analyze sigmoid_kernel.cu · optimize · paste your kernel..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
-        </div>
-        <button class="send-btn" id="sendBtn" onclick="sendMessage()">
-          <svg viewBox="0 0 16 16" fill="none" stroke="#0a0b0d" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M13 8H3M8 3l5 5-5 5"/>
-          </svg>
-        </button>
-      </div>
-      <div class="input-hint"><kbd>Enter</kbd> send &nbsp;·&nbsp; <kbd>Shift+Enter</kbd> new line &nbsp;·&nbsp; <kbd>↑</kbd> recall last</div>
-    </div>
+<!-- ── HERO ── -->
+<div class="hero">
+  <div class="hero-eyebrow">
+    <div class="hero-eyebrow-dot"></div>
+    KERNEL-AWARE RETRIEVAL MEMORY AGENTS
   </div>
 
-  <!-- OPTIMIZATION PANEL -->
-  <div class="opt-panel" id="optPanel">
-    <div class="opt-header">
-      <div>
-        <div class="opt-title">OPTIMIZATION LOOP</div>
-        <div class="opt-kernel" id="optKernelName">—</div>
+  <h1 class="hero-title">
+    <span class="accent">Breakthrough</span> CUDA<br>
+    from Kernel to <span class="accent-green">Deployment</span>
+  </h1>
+
+  <p class="hero-sub">
+    KARMA delivers automated profiling, multi-agent optimization,
+    and verified speedups for CUDA kernels — powered by a retrieval-augmented knowledge base.
+  </p>
+
+  <div class="hero-ctas">
+    <a href="KARMA.html" class="btn-hero-primary">
+      Launch Optimizer <span class="arrow">→</span>
+    </a>
+    <a href="#pipeline" class="btn-hero-ghost">
+      How it works
+    </a>
+  </div>
+
+  <div class="hero-trusted">
+    DESIGNED FOR
+  </div>
+  <div class="hero-trusted-logos">
+    <span class="trusted-logo">CUDA ENGINEERS</span>
+    <span class="trusted-logo">·</span>
+    <span class="trusted-logo">AI RESEARCHERS</span>
+    <span class="trusted-logo">·</span>
+    <span class="trusted-logo">GPU COMPUTE TEAMS</span>
+    <span class="trusted-logo">·</span>
+    <span class="trusted-logo">ML INFRASTRUCTURE</span>
+  </div>
+</div>
+
+<!-- ── STATS ── -->
+<div class="stats-bar">
+  <div class="stat-item">
+    <div class="stat-value">3.4×</div>
+    <div class="stat-label">PEAK SPEEDUP</div>
+  </div>
+  <div class="stat-item">
+    <div class="stat-value green">6</div>
+    <div class="stat-label">SPECIALIZED AGENTS</div>
+  </div>
+  <div class="stat-item">
+    <div class="stat-value">5</div>
+    <div class="stat-label">OPTIMIZATION ROUNDS</div>
+  </div>
+  <div class="stat-item">
+    <div class="stat-value amber">sm_86</div>
+    <div class="stat-label">AMPERE ARCHITECTURE</div>
+  </div>
+</div>
+
+<!-- ── PIPELINE ── -->
+<section id="pipeline">
+  <div class="fade-up">
+    <div class="section-eyebrow">OPTIMIZATION PIPELINE</div>
+    <h2 class="section-title">From raw kernel to <span class="accent-green">peak performance</span></h2>
+    <p class="section-sub">A fully automated multi-round loop: profile, plan, code, compile, benchmark — repeat until optimal.</p>
+  </div>
+
+  <div class="pipeline fade-up">
+    <div class="pipeline-step">
+      <div class="step-num">
+        <span class="step-num-badge">01</span>
+        PROFILING
       </div>
-      <button class="opt-close" onclick="closeOptPanel()">✕</button>
+      <svg class="step-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+        <circle cx="20" cy="20" r="14"/>
+        <path d="M20 20 L20 8"/>
+        <path d="M20 20 L30 26"/>
+        <circle cx="20" cy="20" r="2" fill="currentColor"/>
+      </svg>
+      <div class="step-title">Nsight Profile</div>
+      <div class="step-desc">Runs nvcc compilation and Nsight Systems profiling to establish baseline execution time and identify memory bottlenecks.</div>
+      <span class="step-tag">ncu · nsys</span>
     </div>
-    <div class="opt-body">
-      <div class="opt-progress-wrap">
-        <div class="opt-progress-label"><span>PROGRESS</span><span id="optRoundLabel">0 / 0</span></div>
-        <div class="opt-progress-bar"><div class="opt-progress-fill" id="optProgressFill"></div></div>
+    <div class="pipeline-step">
+      <div class="step-num">
+        <span class="step-num-badge">02</span>
+        CLASSIFICATION
       </div>
-      <div class="opt-pills" id="optPills"></div>
-      <div class="opt-metrics-box" id="optMetricsBox" style="display:none">
-        <div class="opt-metrics-label">PRE-FLIGHT METRICS</div>
-        <div class="opt-metric-row"><span class="opt-metric-key">occupancy</span><span class="opt-metric-val" id="pmOcc">—</span></div>
-        <div class="opt-metric-row"><span class="opt-metric-key">compute throughput</span><span class="opt-metric-val" id="pmComp">—</span></div>
-        <div class="opt-metric-row"><span class="opt-metric-key">dram throughput</span><span class="opt-metric-val" id="pmDram">—</span></div>
-        <div class="opt-metric-row"><span class="opt-metric-key">bottleneck</span><span class="opt-metric-val" id="pmBottleneck">—</span></div>
+      <svg class="step-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+        <rect x="6" y="6" width="12" height="12"/>
+        <rect x="22" y="6" width="12" height="12"/>
+        <rect x="6" y="22" width="12" height="12"/>
+        <rect x="22" y="22" width="12" height="12"/>
+      </svg>
+      <div class="step-title">Kernel Classifier</div>
+      <div class="step-desc">Categorizes the kernel type — reduction, stencil, GEMM, elementwise — and retrieves matching optimizations from the knowledge base.</div>
+      <span class="step-tag">RAG · vector search</span>
+    </div>
+    <div class="pipeline-step">
+      <div class="step-num">
+        <span class="step-num-badge">03</span>
+        PLANNING
       </div>
-      <div class="opt-stats">
-        <div class="opt-stat"><div class="opt-stat-label">BASELINE</div><div class="opt-stat-value dim" id="optBaseline">—</div><div class="opt-stat-sub">original ms</div></div>
-        <div class="opt-stat"><div class="opt-stat-label">BEST SPEEDUP</div><div class="opt-stat-value" id="optBestSpeedup">—</div><div class="opt-stat-sub" id="optBestRound">no result yet</div></div>
-        <div class="opt-stat"><div class="opt-stat-label">CURRENT ROUND</div><div class="opt-stat-value amber" id="optCurrentRound">—</div><div class="opt-stat-sub" id="optStrategy" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">—</div></div>
-        <div class="opt-stat"><div class="opt-stat-label">COMPILE OK</div><div class="opt-stat-value" id="optPasses">0</div><div class="opt-stat-sub" id="optFails">0 failures</div></div>
+      <svg class="step-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+        <path d="M8 12h24M8 20h16M8 28h20"/>
+        <circle cx="32" cy="28" r="4"/>
+        <path d="M32 24v-2M32 36v-2M36 28h2M26 28h2"/>
+      </svg>
+      <div class="step-title">Strategy Planner</div>
+      <div class="step-desc">Generates 5 ranked optimization strategies — shared memory tiling, warp shuffle, vectorized loads — ordered by expected gain.</div>
+      <span class="step-tag">LLM planning</span>
+    </div>
+    <div class="pipeline-step">
+      <div class="step-num">
+        <span class="step-num-badge">04</span>
+        CODING
       </div>
-      <div class="opt-chart-wrap">
-        <div class="opt-chart-label">SPEEDUP PER ROUND</div>
-        <svg viewBox="0 0 290 80" id="optChart">
-          <line x1="0" y1="64" x2="290" y2="64" stroke="#1e2124" stroke-width="1"/>
-          <line x1="0" y1="40" x2="290" y2="40" stroke="#1e2124" stroke-width="0.5" stroke-dasharray="2 3"/>
-          <line x1="0" y1="16" x2="290" y2="16" stroke="#1e2124" stroke-width="0.5" stroke-dasharray="2 3"/>
-          <text x="2" y="67" fill="#5a6170" font-size="6" font-family="monospace">1.0x</text>
-          <text x="2" y="43" fill="#5a6170" font-size="6" font-family="monospace">2.0x</text>
-          <text x="2" y="19" fill="#5a6170" font-size="6" font-family="monospace">3.0x</text>
-          <g id="optChartBars"></g>
-        </svg>
+      <svg class="step-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+        <path d="M14 14L6 20l8 6M26 14l8 6-8 6M22 10l-4 20"/>
+      </svg>
+      <div class="step-title">CUDA Coder</div>
+      <div class="step-desc">Rewrites the kernel in CUDA C++ applying the selected strategy, injecting SM-specific tuning parameters for the target architecture.</div>
+      <span class="step-tag">CUDA C++ · LLM</span>
+    </div>
+    <div class="pipeline-step">
+      <div class="step-num">
+        <span class="step-num-badge">05</span>
+        VALIDATION
       </div>
-      <div class="opt-complete" id="optComplete">
-        <div class="opt-complete-title" id="optCompleteTitle">optimization complete</div>
-        <div class="opt-complete-sub" id="optCompleteSub">—</div>
+      <svg class="step-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+        <path d="M10 20l8 8 14-16"/>
+        <circle cx="20" cy="20" r="14"/>
+      </svg>
+      <div class="step-title">Tester & Reflector</div>
+      <div class="step-desc">Compiles and runs correctness tests. On failure, a reflector agent analyzes the error and auto-patches before retry.</div>
+      <span class="step-tag">nvcc · correctness check</span>
+    </div>
+    <div class="pipeline-step">
+      <div class="step-num">
+        <span class="step-num-badge">06</span>
+        KNOWLEDGE
       </div>
-      <div class="opt-log">
-        <div class="opt-log-label">LIVE LOG</div>
-        <div class="opt-log-entries" id="optLogEntries"></div>
+      <svg class="step-icon" viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+        <ellipse cx="20" cy="14" rx="12" ry="5"/>
+        <path d="M8 14v6c0 2.8 5.4 5 12 5s12-2.2 12-5v-6"/>
+        <path d="M8 20v6c0 2.8 5.4 5 12 5s12-2.2 12-5v-6"/>
+      </svg>
+      <div class="step-title">KnowledgeBase</div>
+      <div class="step-desc">Stores every successful optimization with its speedup, strategy, and kernel fingerprint — enabling accelerated future runs.</div>
+      <span class="step-tag">vector DB · retrieval</span>
+    </div>
+  </div>
+</section>
+
+<!-- ── AGENTS ── -->
+<section id="agents" style="border-top:1px solid var(--border); padding-top:100px;">
+  <div class="fade-up" style="display:flex; gap:80px; align-items:flex-start;">
+    <div style="flex-shrink:0; max-width:320px;">
+      <div class="section-eyebrow">MULTI-AGENT SYSTEM</div>
+      <h2 class="section-title">Six agents, <span class="accent">one mission</span></h2>
+      <p class="section-sub">Each agent is a specialized expert. Together they form a closed optimization loop that rivals hand-tuned CUDA.</p>
+      <a href="KARMA.html" class="btn-hero-primary" style="font-size:13px; padding:12px 24px;">
+        Open Agent Console <span class="arrow">→</span>
+      </a>
+    </div>
+    <div class="agents-grid" style="flex:1;">
+      <div class="agent-card">
+        <div class="agent-header">
+          <div class="agent-name">Classifier Agent</div>
+          <div class="agent-id">AGENT-01</div>
+        </div>
+        <div class="agent-desc">Identifies kernel type and bottleneck pattern. Queries the vector knowledge base for matching prior optimizations.</div>
+        <div class="agent-tags">
+          <span class="agent-tag">RAG</span>
+          <span class="agent-tag">classification</span>
+          <span class="agent-tag">embedding</span>
+        </div>
       </div>
+      <div class="agent-card">
+        <div class="agent-header">
+          <div class="agent-name">Planner Agent</div>
+          <div class="agent-id">AGENT-02</div>
+        </div>
+        <div class="agent-desc">Generates ranked optimization strategies based on kernel class, GPU architecture, and historical speedup data.</div>
+        <div class="agent-tags">
+          <span class="agent-tag">LLM planning</span>
+          <span class="agent-tag">strategy ranking</span>
+        </div>
+      </div>
+      <div class="agent-card">
+        <div class="agent-header">
+          <div class="agent-name">Coder Agent</div>
+          <div class="agent-id">AGENT-03</div>
+        </div>
+        <div class="agent-desc">Rewrites CUDA kernels applying shared memory, warp shuffle, vectorized loads, and architecture-specific tuning.</div>
+        <div class="agent-tags">
+          <span class="agent-tag">CUDA C++</span>
+          <span class="agent-tag">code synthesis</span>
+        </div>
+      </div>
+      <div class="agent-card">
+        <div class="agent-header">
+          <div class="agent-name">Tester Agent</div>
+          <div class="agent-id">AGENT-04</div>
+        </div>
+        <div class="agent-desc">Compiles with nvcc and runs correctness validation against the original kernel output, reporting pass/fail per round.</div>
+        <div class="agent-tags">
+          <span class="agent-tag">nvcc</span>
+          <span class="agent-tag">correctness</span>
+          <span class="agent-tag">benchmarking</span>
+        </div>
+      </div>
+      <div class="agent-card">
+        <div class="agent-header">
+          <div class="agent-name">Reflector Agent</div>
+          <div class="agent-id">AGENT-05</div>
+        </div>
+        <div class="agent-desc">Analyzes compilation errors and runtime failures, generates targeted patches and passes corrected code back to the Coder.</div>
+        <div class="agent-tags">
+          <span class="agent-tag">error analysis</span>
+          <span class="agent-tag">auto-patch</span>
+        </div>
+      </div>
+      <div class="agent-card">
+        <div class="agent-header">
+          <div class="agent-name">Profiler Agent</div>
+          <div class="agent-id">AGENT-06</div>
+        </div>
+        <div class="agent-desc">Runs Nsight profiling on each candidate, measures wall-clock time, and computes speedup ratio against the baseline.</div>
+        <div class="agent-tags">
+          <span class="agent-tag">Nsight</span>
+          <span class="agent-tag">benchmarking</span>
+          <span class="agent-tag">metrics</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── TERMINAL DEMO ── -->
+<div class="section-full" id="demo">
+  <div class="section-full-inner fade-up">
+    <div class="section-eyebrow" style="justify-content:center; margin-bottom:16px;">LIVE DEMO</div>
+    <h2 class="section-full-title">
+      The future of GPU optimization<br>
+      <span class="highlight">starts here</span>
+    </h2>
+    <p style="font-size:14px; color:var(--text-dim); margin:20px auto 0; max-width:440px; line-height:1.75; font-weight:300;">
+      Watch KARMA analyze a sigmoid kernel, run 5 optimization rounds, and deliver a verified 3.4× speedup — all autonomously.
+    </p>
+
+    <div class="terminal">
+      <div class="terminal-bar">
+        <div class="terminal-dot red"></div>
+        <div class="terminal-dot amber"></div>
+        <div class="terminal-dot green"></div>
+        <div class="terminal-title">karma — optimizer shell — sigmoid_kernel.cu</div>
+      </div>
+      <div class="terminal-line"><span class="prompt">›</span> <span class="cmd">karma optimize kernels/sigmoid_kernel.cu --rounds 5 --arch sm_86</span></div>
+      <div class="terminal-line"><span class="output">  [profiler]  baseline: 4.82ms on RTX A4000</span></div>
+      <div class="terminal-line"><span class="output">  [classifier] type: elementwise · bottleneck: uncoalesced global access</span></div>
+      <div class="terminal-line"><span class="output">  [planner]   round 1 → coalesced access + loop unroll</span></div>
+      <div class="terminal-line"><span class="ok">  [tester]    ✓ compiled · speedup: 1.40×</span></div>
+      <div class="terminal-line"><span class="output">  [planner]   round 2 → shared memory tiling</span></div>
+      <div class="terminal-line"><span class="warn">  [tester]    ✗ compilation error — reflector patching...</span></div>
+      <div class="terminal-line"><span class="output">  [planner]   round 3 → shared memory + prefetch</span></div>
+      <div class="terminal-line"><span class="ok">  [tester]    ✓ compiled · speedup: 2.10×</span></div>
+      <div class="terminal-line"><span class="output">  [planner]   round 4 → warp shuffle reduction</span></div>
+      <div class="terminal-line"><span class="ok">  [tester]    ✓ compiled · speedup: 2.80×</span></div>
+      <div class="terminal-line"><span class="output">  [planner]   round 5 → warp shuffle + vectorized float4 loads</span></div>
+      <div class="terminal-line"><span class="ok">  [tester]    ✓ compiled · speedup: 3.40× ← best</span></div>
+      <div class="terminal-line"><span class="dim">  ─────────────────────────────────────────</span></div>
+      <div class="terminal-line"><span class="ok">  [complete]  best: 3.40× · saved kernels/best_optimized.cu</span></div>
+      <div class="terminal-line"><span class="prompt">›</span> <span class="terminal-cursor"></span></div>
+    </div>
+
+    <div style="margin-top:40px;">
+      <a href="KARMA.html" class="btn-hero-primary">
+        Launch Full Optimizer <span class="arrow">→</span>
+      </a>
     </div>
   </div>
 </div>
 
+<!-- ── FOOTER ── -->
+<footer>
+  <div class="footer-logo">
+    <div class="nav-hex" style="width:24px;height:24px;">
+      <svg viewBox="0 0 24 24" fill="none">
+        <polygon points="12,2 22,7 22,17 12,22 2,17 2,7" stroke="#00d4ff" stroke-width="0.8" opacity="0.5"/>
+      </svg>
+      <div class="nav-hex-core" style="width:8px;height:8px;"></div>
+    </div>
+    <span class="footer-wordmark">KARMA</span>
+    <span style="font-size:10px;font-family:var(--mono);color:var(--text-dim);margin-left:8px;">v0.1.0-α</span>
+  </div>
+  <div class="footer-right">
+    Kernel-Aware Retrieval Memory Agents &nbsp;·&nbsp;
+    <a href="KARMA.html">Launch App →</a>
+  </div>
+</footer>
+
 <script>
-// ── STATE ──────────────────────────────────────────────────────────────
-let ws = null;
-let isThinking = false;
-let lastMessage = '';
-let metrics = { kernels:0, speedup:null, passes:0, validations:0 };
-let optState = { rounds:0, passes:0, fails:0, bestSpeedup:null };
-let pendingKernel = null;
-
-// ── GPU INFO ───────────────────────────────────────────────────────────
-async function fetchGPUInfo() {
-  try {
-    const r = await fetch('/api/gpu');
-    const d = await r.json();
-    if (d.gpus && d.gpus.length > 0) {
-      const names = d.gpus.map(g => g.name.replace('NVIDIA ','').replace('GeForce ',''));
-      const unique = [...new Set(names)];
-      const label = d.count > 1 ? `${unique[0]} ×${d.count}` : unique[0];
-      document.getElementById('gpuInfo').textContent = label;
-      // update sidebar sm info
-      if (d.gpus[0].sm) {
-        document.getElementById('gpuInfo').textContent += ` · sm_${d.gpus[0].sm}`;
-      }
-    } else {
-      document.getElementById('gpuInfo').textContent = 'no GPU detected';
+// Fade-in on scroll
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      e.target.classList.add('visible');
+      observer.unobserve(e.target);
     }
-  } catch { document.getElementById('gpuInfo').textContent = 'GPU info unavailable'; }
-}
-
-// ── MODEL SWITCHER ─────────────────────────────────────────────────────
-function updateModel(val) {
-  const notes = {
-    'gemini-2.0-flash': 'fast · cheap · good for chat',
-    'gemini-2.5-pro-preview-05-06': 'best reasoning · slower',
-    'claude-sonnet-4-6': 'strong code · balanced',
-    'claude-opus-4-6': 'best code quality · expensive',
-  };
-  document.getElementById('modelNote').textContent = notes[val] || '';
-}
-
-// ── WEBSOCKET ──────────────────────────────────────────────────────────
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/chat`);
-  ws.onopen = () => setStatus('online');
-  ws.onmessage = handleMessage;
-  ws.onclose = () => { setStatus('offline'); setTimeout(connect, 3000); };
-  ws.onerror = () => setStatus('offline');
-}
-
-function handleMessage(e) {
-  const d = JSON.parse(e.data);
-
-  if (d.type === 'status' && d.text === 'thinking') {
-    showThinking();
-
-  } else if (d.type === 'response') {
-    removeThinking();
-    appendMessage('agent', d.text);
-    setStatus('online');
-    unlock();
-
-  } else if (d.type === 'error') {
-    removeThinking();
-    appendMessage('error', `Error: ${d.text}`);
-    setStatus('online');
-    unlock();
-
-  } else if (d.type === 'kernel_list') {
-    removeThinking();
-    appendKernelList(d.kernels, d.action || 'choose');
-    setStatus('online');
-    unlock();
-
-  } else if (d.type === 'kernel_ready') {
-    pendingKernel = d.kernel;
-
-  } else if (d.type === 'opt_start') {
-    openOptPanel(d.kernel, d.rounds);
-
-  } else if (d.type === 'opt_progress') {
-    optLog(d.text, d.cls || '');
-    if (d.round) optSetRound(d.round, d.total, d.strategy || '');
-    // parse pre-flight metrics from log
-    parsePreflight(d.text);
-
-  } else if (d.type === 'opt_result') {
-    optRoundResult(d.round, d.total, d.speedup, d.passed, d.strategy);
-    if (d.baseline) document.getElementById('optBaseline').textContent = d.baseline.toFixed(2) + 'ms';
-    if (d.passed) { metrics.passes++; document.getElementById('metricPasses').textContent = metrics.passes; }
-    if (d.passed && d.speedup) { metrics.validations++; document.getElementById('metricValidations').textContent = metrics.validations; }
-
-  } else if (d.type === 'opt_complete') {
-    optComplete(d.best_speedup, d.best_round, d.file);
-    setStatus('online');
-    unlock();
-  }
-}
-
-function parsePreflight(text) {
-  const occ = text.match(/occupancy=(\S+)%/);
-  const comp = text.match(/compute=(\S+)%/)?.[1] || text.match(/compute.*?(\d+\.?\d*)%/)?.[1];
-  const dram = text.match(/dram=(\S+)%/);
-  if (occ) { document.getElementById('pmOcc').textContent = occ[1]+'%'; document.getElementById('optMetricsBox').style.display='block'; }
-  if (dram) {
-    document.getElementById('pmDram').textContent = dram[1]+'%';
-    const d = parseFloat(dram[1]), c = parseFloat(document.getElementById('pmComp').textContent) || 0;
-    document.getElementById('pmBottleneck').textContent = d > c ? 'memory-bound' : 'compute-bound';
-  }
-  if (comp) document.getElementById('pmComp').textContent = comp+'%';
-}
-
-// ── STATUS ─────────────────────────────────────────────────────────────
-function setStatus(state) {
-  document.getElementById('statusDot').className = 'status-dot' + (state==='offline'?' offline':state==='thinking'?' thinking':'');
-  document.getElementById('statusText').textContent = state==='online'?'agent ready':state==='offline'?'reconnecting...':'thinking...';
-}
-
-function unlock() {
-  isThinking = false;
-  document.getElementById('sendBtn').disabled = false;
-}
-
-// ── SEND ───────────────────────────────────────────────────────────────
-function sendMessage() {
-  const input = document.getElementById('userInput');
-  const text = input.value.trim();
-  if (!text || isThinking || !ws || ws.readyState !== WebSocket.OPEN) return;
-  lastMessage = text;
-  hideWelcome();
-  appendMessage('user', text);
-  input.value = '';
-  input.style.height = 'auto';
-  setStatus('thinking');
-  isThinking = true;
-  document.getElementById('sendBtn').disabled = true;
-  ws.send(JSON.stringify({ message: text, model: document.getElementById('modelSelect').value }));
-}
-
-function sendQuick(text) {
-  document.getElementById('userInput').value = text;
-  sendMessage();
-}
-
-function handleKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-  if (e.key === 'ArrowUp' && !document.getElementById('userInput').value) {
-    document.getElementById('userInput').value = lastMessage;
-    autoResize(document.getElementById('userInput'));
-  }
-}
-
-function autoResize(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 180) + 'px';
-}
-
-// ── MESSAGES ───────────────────────────────────────────────────────────
-function hideWelcome() {
-  const w = document.getElementById('welcome');
-  if (w) w.remove();
-}
-
-function appendMessage(role, text) {
-  const msgs = document.getElementById('messages');
-  const div = document.createElement('div');
-  div.className = 'msg';
-  const avatar = role==='user'?'YOU':role==='error'?'ERR':'AI';
-  const t = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  div.innerHTML = `
-    <div class="msg-avatar ${role==='agent'?'agent':role==='error'?'error':'user'}">${avatar}</div>
-    <div class="msg-body">
-      <div class="msg-meta">
-        <span class="msg-author ${role}">${role==='user'?'USER':role==='error'?'ERROR':'KARMA'}</span>
-        <span class="msg-time">${t}</span>
-      </div>
-      <div class="msg-content">${renderContent(text)}</div>
-    </div>`;
-  msgs.appendChild(div);
-  msgs.scrollTop = msgs.scrollHeight;
-  div.querySelectorAll('.copy-btn').forEach(btn => {
-    btn.onclick = () => { navigator.clipboard.writeText(btn.dataset.code); btn.textContent='copied'; setTimeout(()=>btn.textContent='copy',1500); };
   });
-}
+}, { threshold: 0.1 });
 
-function showThinking() {
-  if (document.getElementById('thinkingMsg')) return;
-  const msgs = document.getElementById('messages');
-  const div = document.createElement('div');
-  div.className = 'msg thinking-msg'; div.id = 'thinkingMsg';
-  div.innerHTML = `
-    <div class="msg-avatar agent">AI</div>
-    <div class="msg-body">
-      <div class="msg-meta"><span class="msg-author agent">KARMA</span></div>
-      <div class="msg-content">
-        <div class="thinking-dots"><span></span><span></span><span></span></div>
-        <span style="font-size:11px;color:var(--text-dim)">thinking...</span>
-      </div>
-    </div>`;
-  msgs.appendChild(div);
-  msgs.scrollTop = msgs.scrollHeight;
-}
+document.querySelectorAll('.fade-up').forEach(el => observer.observe(el));
 
-function removeThinking() {
-  const t = document.getElementById('thinkingMsg');
-  if (t) t.remove();
-}
+// Stagger pipeline steps
+document.querySelectorAll('.pipeline-step').forEach((el, i) => {
+  el.style.transitionDelay = (i * 60) + 'ms';
+  el.classList.add('fade-up');
+  observer.observe(el);
+});
 
-// ── RENDER ─────────────────────────────────────────────────────────────
-function renderContent(text) {
-  let out = text.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-  out = out.replace(/```(\w+)?\n?([\s\S]*?)```/g, (_,lang,code) => {
-    const esc = code.trim();
-    return `<pre><span class="lang-tag">${lang||'code'}</span><button class="copy-btn" data-code="${esc.replace(/"/g,'&quot;')}">copy</button><code>${esc}</code></pre>`;
-  });
-  out = out.replace(/`([^`]+)`/g,'<code>$1</code>');
-  out = out.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
-  out = out.replace(/^[\-\*] (.+)$/gm,'<li>$1</li>');
-  out = out.replace(/(<li>.*<\/li>)/gs,'<ul style="padding-left:16px;margin:6px 0">$1</ul>');
-  const paras = out.split(/\n\n+/);
-  if (paras.length > 1) out = paras.map(p=>p.trim()?`<p>${p.replace(/\n/g,'<br>')}</p>`:'').join('');
-  else out = out.replace(/\n/g,'<br>');
-  return out;
-}
-
-// ── KERNEL LIST ────────────────────────────────────────────────────────
-function appendKernelList(kernels, action) {
-  hideWelcome();
-  const msgs = document.getElementById('messages');
-  const div = document.createElement('div');
-  div.className = 'msg';
-  const t = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  const label = action === 'analyze' ? 'analyze' : 'choose an action';
-  const items = kernels.map(k => {
-    const name = k.split('/').pop();
-    return `<div class="kernel-btn">
-      <span class="kb-icon">▸</span>
-      <span>${name}</span>
-      <div class="kb-actions">
-        <button class="kb-act" onclick="analyzeKernel('${k}')">analyze</button>
-        <button class="kb-act" onclick="optimizeKernel('${k}')">optimize</button>
-      </div>
-    </div>`;
-  }).join('');
-  div.innerHTML = `
-    <div class="msg-avatar agent">AI</div>
-    <div class="msg-body">
-      <div class="msg-meta"><span class="msg-author agent">KARMA</span><span class="msg-time">${t}</span></div>
-      <div class="msg-content">
-        <p style="margin-bottom:10px;font-size:12px;font-family:var(--sans)">Found ${kernels.length} kernel${kernels.length!==1?'s':''}. ${label}:</p>
-        ${items}
-      </div>
-    </div>`;
-  msgs.appendChild(div);
-  msgs.scrollTop = msgs.scrollHeight;
-}
-
-function analyzeKernel(path) {
-  hideWelcome();
-  const name = path.split('/').pop();
-  appendMessage('user', `analyze ${name}`);
-  setStatus('thinking'); isThinking = true;
-  document.getElementById('sendBtn').disabled = true;
-  ws.send(JSON.stringify({ message: `__analyze__:${path}`, model: document.getElementById('modelSelect').value }));
-}
-
-function optimizeKernel(path) {
-  hideWelcome();
-  const name = path.split('/').pop();
-  appendMessage('user', `optimize ${name}`);
-  setStatus('thinking'); isThinking = true;
-  document.getElementById('sendBtn').disabled = true;
-  ws.send(JSON.stringify({ message: `__optimize__:${path}`, model: document.getElementById('modelSelect').value }));
-}
-
-// ── OPTIMIZATION PANEL ─────────────────────────────────────────────────
-function openOptPanel(kernel, rounds) {
-  optState = { rounds, passes:0, fails:0, bestSpeedup:null };
-  document.getElementById('optPanel').classList.add('open');
-  document.getElementById('optKernelName').textContent = kernel || '—';
-  document.getElementById('optRoundLabel').textContent = `0 / ${rounds}`;
-  document.getElementById('optProgressFill').style.width = '0%';
-  document.getElementById('optChartBars').innerHTML = '';
-  document.getElementById('optLogEntries').innerHTML = '';
-  document.getElementById('optComplete').classList.remove('show');
-  document.getElementById('optBestSpeedup').textContent = '—';
-  document.getElementById('optBestRound').textContent = 'no result yet';
-  document.getElementById('optBaseline').textContent = '—';
-  document.getElementById('optPasses').textContent = '0';
-  document.getElementById('optFails').textContent = '0 failures';
-  document.getElementById('optCurrentRound').textContent = '—';
-  document.getElementById('optStrategy').textContent = '—';
-  document.getElementById('optMetricsBox').style.display = 'none';
-  document.getElementById('pmOcc').textContent = '—';
-  document.getElementById('pmComp').textContent = '—';
-  document.getElementById('pmDram').textContent = '—';
-  document.getElementById('pmBottleneck').textContent = '—';
-  const pills = document.getElementById('optPills');
-  pills.innerHTML = '';
-  for (let i=1; i<=rounds; i++) {
-    const p = document.createElement('div');
-    p.className='opt-pill'; p.id='optpill-'+i; p.textContent='round '+i;
-    pills.appendChild(p);
-  }
-}
-
-function closeOptPanel() { document.getElementById('optPanel').classList.remove('open'); }
-
-function optLog(text, cls) {
-  const el = document.getElementById('optLogEntries');
-  const t = new Date().toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-  const row = document.createElement('div');
-  row.className='opt-log-row';
-  row.innerHTML=`<span class="opt-log-t">${t}</span><span class="opt-log-msg ${cls}">${text}</span>`;
-  el.appendChild(row);
-  el.scrollTop = el.scrollHeight;
-}
-
-function optSetRound(round, total, strategy) {
-  document.getElementById('optRoundLabel').textContent = `${round} / ${total}`;
-  document.getElementById('optCurrentRound').textContent = `${round} / ${total}`;
-  document.getElementById('optStrategy').textContent = strategy;
-  const pill = document.getElementById('optpill-'+round);
-  if (pill) { document.querySelectorAll('.opt-pill.active').forEach(p=>p.classList.remove('active')); pill.classList.add('active'); }
-}
-
-function optRoundResult(round, total, speedup, passed, strategy) {
-  const pill = document.getElementById('optpill-'+round);
-  if (pill) { pill.classList.remove('active'); pill.classList.add(passed?'ok':'fail'); }
-  document.getElementById('optProgressFill').style.width = `${(round/total)*100}%`;
-  const bars = document.getElementById('optChartBars');
-  const barW=30, gap=8, x=22+(round-1)*(barW+gap);
-  const barH = passed ? Math.max(4,Math.min(48,((speedup-1)/2)*48)) : 4;
-  const barY = 64-barH;
-  const color = !passed?'#ff4d6a':speedup>=2?'#00e5a0':'#f5a623';
-  const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
-  rect.setAttribute('x',x); rect.setAttribute('y',barY);
-  rect.setAttribute('width',barW); rect.setAttribute('height',barH);
-  rect.setAttribute('fill',color); rect.setAttribute('opacity','0.85');
-  bars.appendChild(rect);
-  if (passed && speedup) {
-    const lbl = document.createElementNS('http://www.w3.org/2000/svg','text');
-    lbl.setAttribute('x',x+barW/2); lbl.setAttribute('y',barY-3);
-    lbl.setAttribute('text-anchor','middle'); lbl.setAttribute('fill',color);
-    lbl.setAttribute('font-size','6'); lbl.setAttribute('font-family','monospace');
-    lbl.textContent = speedup.toFixed(2)+'x';
-    bars.appendChild(lbl);
-    if (!optState.bestSpeedup || speedup > optState.bestSpeedup) {
-      optState.bestSpeedup = speedup;
-      document.getElementById('optBestSpeedup').textContent = speedup.toFixed(2)+'x';
-      document.getElementById('optBestRound').textContent = `round ${round}`;
-      metrics.speedup = speedup;
-      document.getElementById('metricSpeedup').textContent = speedup.toFixed(2)+'x';
-    }
-    optState.passes++;
-    document.getElementById('optPasses').textContent = optState.passes;
-  } else {
-    optState.fails++;
-    document.getElementById('optFails').textContent = `${optState.fails} failure${optState.fails>1?'s':''}`;
-  }
-}
-
-function optComplete(bestSpeedup, bestRound, file) {
-  document.getElementById('optComplete').classList.add('show');
-  document.getElementById('optCompleteTitle').textContent = `best speedup: ${bestSpeedup?bestSpeedup.toFixed(2)+'x':'—'}`;
-  document.getElementById('optCompleteSub').textContent = `round ${bestRound} · saved ${file||'best_optimized.cu'}`;
-  document.getElementById('optProgressFill').style.width = '100%';
-  metrics.kernels++;
-  document.getElementById('metricKernels').textContent = metrics.kernels;
-  optLog(`complete — best ${bestSpeedup?bestSpeedup.toFixed(2)+'x':'—'} in round ${bestRound}`,'ok');
-}
-
-// ── INIT ───────────────────────────────────────────────────────────────
-fetchGPUInfo();
-connect();
-updateModel(document.getElementById('modelSelect').value);
-document.getElementById('userInput').focus();
+// Stagger agent cards
+document.querySelectorAll('.agent-card').forEach((el, i) => {
+  el.style.transitionDelay = (i * 50) + 'ms';
+  el.classList.add('fade-up');
+  observer.observe(el);
+});
 </script>
 </body>
 </html>

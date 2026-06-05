@@ -16,7 +16,9 @@ from google.adk.sessions import InMemorySessionService
 from google.adk.errors import already_exists_error
 from tools.getfiles import getFiles
 from tools.readfiles import readFile
+from dotenv import load_dotenv
 
+load_dotenv()
 
 import warnings
 warnings.filterwarnings("ignore")

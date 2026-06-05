@@ -15,6 +15,10 @@ from Agents.coder import safe_chat, runner, USER_ID, SESSION_ID
 from knowledgeBase.store import KnowledgeBase
 from knowledgeBase.reflector import reflect
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 # initialize once at module level
 kb = KnowledgeBase()
 
