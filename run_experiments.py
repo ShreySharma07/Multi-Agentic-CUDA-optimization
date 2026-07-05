@@ -3,12 +3,33 @@
 Headless experiment runner for KARMA.
 Runs optimization loop on KernelBench / SGLang / own kernels.
 Saves results to CSV after every kernel (crash-safe).
+
+optimize_one() flow (per kernel):
+  pre_flight (ncu metrics)
+    → ClassifierAgent.classify()   [once, if USE_CLASSIFIER]  — soft prior:
+        kernel_type / bottleneck / preferred_strategies / confidence
+        (also logged to results/classifier_log.csv for offline accuracy scoring)
+    → baseline benchmark (mean ± std over TIMED_RUNS)
+    → KB.retrieve()                keyed by kernel_type to sharpen retrieval
+    → round loop (1..ROUNDS):
+        PlanningAgent.plan()       [each round, if USE_PLANNER] — turns the
+            prior + metrics + KB + history into ONE concrete strategy+changes;
+            free to choose "other" (escape hatch — prior is never a hard filter)
+          → CoderAgent generates the .cu (told to implement the plan exactly,
+            or freeform if planner disabled)
+          → compile → dims_match gate → validate → benchmark (stability check)
+          → reflect → KB.store; failed strategy names feed the next plan's avoid
+    → best kernel + metrics written to results/experiments.csv
+
+Ablation flags: --no-kb  --no-reflect  --no-classifier  --no-planner
+Disabling both new agents reproduces the original pipeline exactly.
 """
 from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
 import csv
+import json
 import re
 import importlib.util
 from pathlib import Path
@@ -21,9 +42,12 @@ from pipeline.compiler import compile_cuda
 from pipeline.pre_flight import pre_flight
 from pipeline.validator import run_validation
 from pipeline.benchmarker import benchmark
+from pipeline.dims import dims_match
 
 # agent
 from Agents.coder import safe_chat, runner, USER_ID, SESSION_ID
+from Agents.classifier import ClassifierAgent, append_classifier_log
+from Agents.planner import PlanningAgent
 
 # knowledge (novel contribution)
 from knowledge.store import KnowledgeBase
@@ -36,11 +60,15 @@ WARMUP_RUNS  = 3
 TIMED_RUNS   = 10
 TIMEOUT_SEC  = 10
 GPU_ARCH     = "sm_86"
-USE_KB       = True      # set False for ablation: no knowledge base
-USE_REFLECT  = True      # set False for ablation: no reflection agent
+USE_KB         = True    # set False for ablation: no knowledge base
+USE_REFLECT    = True    # set False for ablation: no reflection agent
+USE_CLASSIFIER = True    # set False for ablation: no per-kernel classification
+USE_PLANNER    = True    # set False for ablation: no per-round planning
 
-# ── Initialize KnowledgeBase ───────────────────────────────────────────
+# ── Initialize KnowledgeBase + agents ──────────────────────────────────
 kb = KnowledgeBase() if USE_KB else None
+classifier = ClassifierAgent(safe_chat, runner, USER_ID, SESSION_ID) if USE_CLASSIFIER else None
+planner = PlanningAgent(safe_chat, runner, USER_ID, SESSION_ID) if USE_PLANNER else None
 
 
 # ── Pydantic result schema ─────────────────────────────────────────────
@@ -53,13 +81,23 @@ class ExperimentResult(BaseModel):
     compute_throughput:   float = 0.0
     dram_throughput:      float = 0.0
     baseline_ms:          float = 0.0
+    baseline_ms_initial:  float = 0.0  # first measurement, before any round ran
+    baseline_ms_final:    float = 0.0  # freshest re-measurement, taken back-to-back with best_ms
+    baseline_drift_pct:   float = 0.0  # |final - initial| / initial -- thermal/clock drift signal
     best_ms:              float = 0.0
+    best_ms_std:          float = 0.0  # stddev of the winning round's timed runs
     best_speedup:         float = 0.0
     best_round:           int   = 0
     rounds_total:         int   = 0
     compile_failures:     int   = 0
     validation_failures:  int   = 0
+    dims_mismatches:      int   = 0  # rounds rejected for changing problem size
+    unstable_rounds:      int   = 0  # rounds that failed their own check on a timed run
     kb_entries_used:      int   = 0
+    kernel_type:              str = ""   # ClassifierAgent label
+    classifier_confidence:    str = ""   # high | medium | low
+    strategies_tried:         str = ""   # semicolon-joined per-round strategy names
+    planner_used_other_count: int = 0    # rounds where the planner went off-taxonomy
     pytorch_ref:          Optional[str] = None
 
 
@@ -81,13 +119,45 @@ def extract_cuda_code(text: str) -> str:
 
 
 def append_result(row: dict):
+    """
+    Append one result row, keyed by column name rather than position.
+
+    ExperimentResult's schema has changed before without the CSV header being
+    migrated (a previous run appended a `pytorch_ref` column with no header
+    update, so that row silently has one more value than the header has
+    columns). DictWriter with a bare `fieldnames=row.keys()` only writes a
+    header on first-ever creation, so any later schema change just appends
+    misaligned columns forever after. Detect a header mismatch here and
+    migrate the whole file onto the union of columns instead.
+    """
     Path("results").mkdir(exist_ok=True)
-    exists = Path(RESULTS_CSV).exists()
-    with open(RESULTS_CSV, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if not exists:
+    csv_path = Path(RESULTS_CSV)
+    fieldnames = list(row.keys())
+
+    if csv_path.exists():
+        with open(csv_path, newline="") as f:
+            existing_rows = list(csv.DictReader(f))
+        existing_header = list(existing_rows[0].keys()) if existing_rows else []
+
+        if existing_header and existing_header != fieldnames:
+            union_fields = fieldnames + [c for c in existing_header if c not in fieldnames]
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=union_fields, restval="")
+                writer.writeheader()
+                for old_row in existing_rows:
+                    old_row.pop(None, None)  # overflow values DictReader stashed under None
+                    writer.writerow(old_row)
+                writer.writerow(row)
+            print(f"  → schema changed — migrated {RESULTS_CSV} to the new column set")
+            return
+
+        with open(csv_path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fieldnames).writerow(row)
+    else:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
-        writer.writerow(row)
+            writer.writerow(row)
     print(f"  → saved to {RESULTS_CSV}")
 
 
@@ -143,21 +213,46 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
     else:
         print(f"  pre-flight unavailable — no metrics")
 
-    # ── baseline timing (once, before loop) ────────────────────────
+    metrics = {"occupancy": occ, "compute_throughput": comp, "dram_throughput": dram}
+
+    # ── baseline timing (before loop; re-measured each round, see below) ──
     print("  benchmarking baseline...")
     baseline_ms = 0.0
+    baseline_ms_initial = 0.0
+    baseline_std = 0.0
     base_ok, base_bin = compile_cuda(str(kernel_path))
     if base_ok:
-        baseline_ms = benchmark(base_bin)
-        print(f"  baseline: {baseline_ms:.3f}ms")
+        base_stats = benchmark(base_bin, warmup=WARMUP_RUNS, runs=TIMED_RUNS)
+        baseline_ms = base_stats["mean_ms"]
+        baseline_ms_initial = baseline_ms
+        baseline_std = base_stats["std_ms"]
+        cov = (baseline_std / baseline_ms * 100) if baseline_ms else 0.0
+        print(f"  baseline: {baseline_ms:.3f}ms (±{baseline_std:.3f}ms, {cov:.1f}% CoV over {base_stats['n']} runs)")
     else:
         print("  baseline compile failed — speedup will be 0")
 
+    # ── classification (once per kernel, soft prior for the planner) ──
+    classification = None
+    kernel_type_out = ""
+    classifier_conf_out = ""
+    if USE_CLASSIFIER and classifier:
+        classification = await classifier.classify(source, metrics)
+        kernel_type_out = classification["kernel_type"]
+        classifier_conf_out = classification["confidence"]
+        print(f"  classifier: type={kernel_type_out} bottleneck={classification['bottleneck']} "
+              f"conf={classifier_conf_out} · prefers={classification['preferred_strategies']}")
+        print(f"    rationale: {classification['rationale']}")
+        append_classifier_log(name, classification)
+
     # ── KnowledgeBase retrieval ────────────────────────────────────
+    # Keyed by the classifier's kernel_type when available so retrieval matches
+    # on the compute pattern rather than the (often opaque) file name.
+    retrieval_key = kernel_type_out if (USE_CLASSIFIER and classification) else name
     kb_ctx = ""
     kb_used = 0
+    kb_results = []
     if USE_KB and kb:
-        kb_results = kb.retrieve(bottleneck=hint, kernel_name=name)
+        kb_results = kb.retrieve(bottleneck=hint, kernel_name=retrieval_key)
         kb_used = len(kb_results)
         if kb_results:
             kb_ctx = "Relevant past optimizations from KnowledgeBase:\n"
@@ -178,6 +273,9 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
     best_speedup = None
     best_round   = None
     best_code    = source
+    best_std     = 0.0
+    baseline_drift_pct = 0.0
+    planner_other_count = 0
     history      = []
 
     strategy_hint = {
@@ -200,6 +298,16 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
                     history_ctx += f"  Round {h['round']}: COMPILE FAILED — {h.get('error','')[:100]}\n"
                 elif h["result"] == "validation_failed":
                     history_ctx += f"  Round {h['round']}: VALIDATION FAILED — math incorrect\n"
+                elif h["result"] == "dims_mismatch":
+                    history_ctx += (
+                        f"  Round {h['round']}: REJECTED — changed problem size "
+                        f"({h.get('error','')[:100]}). Keep dimensions identical.\n"
+                    )
+                elif h["result"] == "unstable":
+                    history_ctx += (
+                        f"  Round {h['round']}: REJECTED — nondeterministic, failed its own "
+                        f"check on a later run. Likely a race condition.\n"
+                    )
                 elif h["result"] == "empty_response":
                     history_ctx += f"  Round {h['round']}: agent returned no valid code\n"
             history_ctx += "\n"
@@ -208,9 +316,29 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         if best_speedup:
             best_ctx = f"Current best: {best_speedup:.2f}x — beat this.\n\n"
 
+        # ── planning (once per round; turns prior+metrics+KB+history into a plan) ──
+        current_strategy = "agent_choice"
+        if USE_PLANNER and planner:
+            current_plan = await planner.plan(
+                classification, metrics, kb_results, history, best_speedup
+            )
+            current_strategy = current_plan.get("strategy", "agent_choice")
+            if current_plan.get("strategy_is_other"):
+                planner_other_count += 1
+            print(f"  round {r}: plan → {current_strategy}"
+                  + (" (other)" if current_plan.get("strategy_is_other") else ""))
+            guidance = (
+                "Implement EXACTLY this plan. Do not choose a different strategy:\n"
+                + json.dumps(current_plan, indent=2)
+                + "\n\n"
+            )
+        else:
+            guidance = f"{strategy_hint}\n\n"
+
         prompt = (
             f"You are a CUDA expert optimizing for RTX A4000 ({GPU_ARCH} Ampere).\n"
-            f"Round {r} of {ROUNDS}. {strategy_hint}\n\n"
+            f"Round {r} of {ROUNDS}.\n\n"
+            f"{guidance}"
             f"{metrics_ctx}"
             f"{kb_ctx}"
             f"{history_ctx}"
@@ -224,7 +352,14 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             f"  'GPU Time: %f' print, the 'DIFF=%e' print and the SUCCESS/FAILURE\n"
             f"  logic and its problem dimensions EXACTLY as given. Optimize only the\n"
             f"  device kernel(s) and their launch config — never delete or weaken\n"
-            f"  the verification, and never change the tolerance to force a pass.\n\n"
+            f"  the verification, and never change the tolerance to force a pass.\n"
+            f"- Do NOT change any problem-size constant (N, N_TEST, dimensions, matrix\n"
+            f"  size, etc.) from the given kernel. This is checked automatically —\n"
+            f"  any round that shrinks or grows the problem size is rejected outright,\n"
+            f"  no matter how fast it measures.\n"
+            f"- If the given kernel already reads the BENCH_ONLY environment variable\n"
+            f"  to skip its CPU reference, keep that check intact — do not remove it\n"
+            f"  or change its behavior.\n\n"
             f"OUTPUT RULES — no exceptions:\n"
             f"- Return ONLY the raw .cu file.\n"
             f"- First character must be '#' (from #include).\n"
@@ -238,7 +373,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
 
         if not optimized or len(optimized) < 30:
             print(f"  round {r}: invalid/empty output — skipping")
-            history.append({"round": r, "result": "empty_response"})
+            history.append({"round": r, "result": "empty_response", "strategy": current_strategy})
             continue
 
         tmp = Path(f"kernels/tmp_exp_r{r}.cu")
@@ -251,7 +386,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         if not ok:
             err = str(result)[:400]
             print(f"  round {r}: COMPILE FAILED — {err[:80]}")
-            history.append({"round": r, "result": "compile_failed", "error": err})
+            history.append({"round": r, "result": "compile_failed", "error": err, "strategy": current_strategy})
             # feed error into next round
             best_code = (
                 "// COMPILE ERROR — fix these exact errors first:\n"
@@ -276,7 +411,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         if not val_ok:
             msg = str(val_msg)[:200]
             print(f"  round {r}: VALIDATION FAILED — {msg[:60]}")
-            history.append({"round": r, "result": "validation_failed"})
+            history.append({"round": r, "result": "validation_failed", "strategy": current_strategy})
             best_code = (
                 f"// VALIDATION FAILED — output wrong.\n"
                 f"// Message: {msg}\n"
@@ -293,22 +428,86 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
                 print(f"    KB stored: {insight['strategy_used'][:50]}")
             continue
 
+        # ── problem-size equivalence gate ───────────────────────────
+        # A kernel can pass validation yet still be "faster" only because it
+        # quietly shrank the problem (e.g. N_TEST). Reject that before it
+        # ever reaches the benchmark, rather than trusting the prompt alone.
+        dims_ok, dims_msg = dims_match(source, optimized)
+        if not dims_ok:
+            print(f"  round {r}: PROBLEM-SIZE MISMATCH — {dims_msg}")
+            history.append({"round": r, "result": "dims_mismatch", "error": dims_msg, "strategy": current_strategy})
+            best_code = (
+                f"// REJECTED — you changed the problem dimensions: {dims_msg}\n"
+                f"// Dimensions must stay IDENTICAL to the baseline. A smaller\n"
+                f"// problem is not a valid optimization and is checked automatically.\n\n"
+                + optimized
+            )
+            if USE_REFLECT and kb:
+                insight = await reflect(
+                    safe_chat, runner, USER_ID, SESSION_ID,
+                    kernel_name=name, bottleneck=hint, round_num=r,
+                    code=optimized, result="dims_mismatch", error=dims_msg
+                )
+                kb.store(insight)
+                print(f"    KB stored: {insight['strategy_used'][:50]}")
+            continue
+
         # ── benchmark ──────────────────────────────────────────────
-        opt_ms = benchmark(result)
+        # Re-measure the baseline back-to-back with the candidate so both
+        # numbers are taken under the same thermal/clock conditions, instead
+        # of trusting a baseline measured minutes (and rounds) earlier.
+        fresh_base = benchmark(base_bin, warmup=WARMUP_RUNS, runs=TIMED_RUNS)
+        if fresh_base["n"] > 0:
+            baseline_ms = fresh_base["mean_ms"]
+        baseline_drift_pct = (
+            100.0 * abs(baseline_ms - baseline_ms_initial) / baseline_ms_initial
+            if baseline_ms_initial > 0 else 0.0
+        )
+
+        opt_stats = benchmark(result, warmup=WARMUP_RUNS, runs=TIMED_RUNS)
+        opt_ms = opt_stats["mean_ms"]
+
+        if not opt_stats["stable"]:
+            # Passed run_validation() once, then printed a failure token on a
+            # later timed run — it's not deterministically correct (likely a
+            # race condition), so its "speed" isn't a real result.
+            print(f"  round {r}: UNSTABLE — kernel failed its own check on a later "
+                  f"timed run (nondeterministic) — discarding")
+            history.append({"round": r, "result": "unstable", "strategy": current_strategy})
+            best_code = (
+                "// REJECTED — this kernel passed validation once but printed a\n"
+                "// FAILURE/MISMATCH token on a later timed run, so it is not\n"
+                "// deterministically correct (likely a race condition). Fix the\n"
+                "// synchronization — don't just resubmit the same kernel.\n\n"
+                + optimized
+            )
+            if USE_REFLECT and kb:
+                insight = await reflect(
+                    safe_chat, runner, USER_ID, SESSION_ID,
+                    kernel_name=name, bottleneck=hint, round_num=r,
+                    code=optimized, result="unstable", error="nondeterministic correctness"
+                )
+                kb.store(insight)
+                print(f"    KB stored: {insight['strategy_used'][:50]}")
+            continue
+
         if opt_ms <= 0 or baseline_ms <= 0:
             print(f"  round {r}: benchmark returned 0 — binary may not print 'GPU Time'")
             speedup = 0.0
         else:
             speedup = round(baseline_ms / opt_ms, 4)
 
-        print(f"  round {r}: ✓ {opt_ms:.3f}ms → {speedup:.2f}x speedup")
-        history.append({"round": r, "speedup": speedup, "result": "success"})
+        cov = (opt_stats["std_ms"] / opt_ms * 100) if opt_ms else 0.0
+        print(f"  round {r}: ✓ {opt_ms:.3f}ms (±{opt_stats['std_ms']:.3f}ms, {cov:.1f}% CoV) "
+              f"→ {speedup:.2f}x speedup [baseline {baseline_ms:.3f}ms, drift {baseline_drift_pct:+.1f}%]")
+        history.append({"round": r, "speedup": speedup, "result": "success", "strategy": current_strategy})
 
         # track best
         if best_speedup is None or speedup > best_speedup:
             best_speedup = speedup
             best_round   = r
             best_code    = optimized
+            best_std     = opt_stats["std_ms"]
             Path("kernels/results").mkdir(exist_ok=True)
             Path(f"kernels/results/{name}").write_text(optimized)
             print(f"  new best — saved kernels/results/{name}")
@@ -344,10 +543,14 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
     # ── build result ───────────────────────────────────────────────
     n_compile = sum(1 for h in history if h["result"] == "compile_failed")
     n_val     = sum(1 for h in history if h["result"] == "validation_failed")
+    n_dims    = sum(1 for h in history if h["result"] == "dims_mismatch")
+    n_unstable = sum(1 for h in history if h["result"] == "unstable")
+    strategies_tried = ";".join(h.get("strategy", "agent_choice") for h in history)
 
     print(f"\n  RESULT: best={'%.4f' % best_speedup if best_speedup else '0'}x  "
           f"round={best_round}  compile_fails={n_compile}  val_fails={n_val}  "
-          f"kb_entries={kb.count() if kb else 0}")
+          f"dims_mismatches={n_dims}  unstable={n_unstable}  "
+          f"baseline_drift={baseline_drift_pct:.1f}%  kb_entries={kb.count() if kb else 0}")
 
     result = ExperimentResult(
         timestamp=datetime.now().isoformat(),
@@ -358,13 +561,23 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         compute_throughput=comp,
         dram_throughput=dram,
         baseline_ms=baseline_ms,
+        baseline_ms_initial=baseline_ms_initial,
+        baseline_ms_final=baseline_ms,
+        baseline_drift_pct=baseline_drift_pct,
         best_ms=round(baseline_ms / best_speedup, 4) if best_speedup and best_speedup > 0 else 0.0,
+        best_ms_std=best_std,
         best_speedup=best_speedup or 0.0,
         best_round=best_round or 0,
         rounds_total=len(history),
         compile_failures=n_compile,
         validation_failures=n_val,
+        dims_mismatches=n_dims,
+        unstable_rounds=n_unstable,
         kb_entries_used=kb_used,
+        kernel_type=kernel_type_out,
+        classifier_confidence=classifier_conf_out,
+        strategies_tried=strategies_tried,
+        planner_used_other_count=planner_other_count,
     )
     return result.model_dump()
 
@@ -444,6 +657,12 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
             f"  elements (e.g. up to 4096 evenly-spaced indices) instead of every element.\n"
             f"- Print EXACTLY one line:  printf(\"DIFF=%e\\n\", max_rel);\n"
             f"- Then print SUCCESS if max_rel <= tol, else FAILURE.\n"
+            f"- At the very start of main(), check: if (getenv(\"BENCH_ONLY\") != NULL).\n"
+            f"  When set, SKIP the CPU reference computation and the DIFF/SUCCESS/FAILURE\n"
+            f"  prints entirely — still allocate, run the GPU kernel, and print the\n"
+            f"  'GPU Time: %f ms' line exactly as always. This lets the benchmark harness\n"
+            f"  time the kernel alone, over many repeated runs, without redoing the CPU-side\n"
+            f"  validation (which is only needed once, on a normal run).\n"
         )
 
         print(f"  generating baseline CUDA from PyTorch...")
@@ -514,6 +733,14 @@ if __name__ == "__main__":
     if "--no-reflect" in sys.argv:
         USE_REFLECT = False
         print("⚠  ABLATION MODE: ReflectionAgent disabled")
+    if "--no-classifier" in sys.argv:
+        USE_CLASSIFIER = False
+        classifier = None
+        print("⚠  ABLATION MODE: ClassifierAgent disabled")
+    if "--no-planner" in sys.argv:
+        USE_PLANNER = False
+        planner = None
+        print("⚠  ABLATION MODE: PlanningAgent disabled")
 
     if mode == "own":
         asyncio.run(run_own_kernels())
@@ -526,4 +753,4 @@ if __name__ == "__main__":
         asyncio.run(run_sglang(max_kernels=count))
     else:
         print("Usage: python run_experiments.py [own|kernelbench|sglang] [level] [max_kernels]")
-        print("Flags: --no-kb  --no-reflect")
+        print("Flags: --no-kb  --no-reflect  --no-classifier  --no-planner")
