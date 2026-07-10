@@ -2,6 +2,10 @@ import subprocess
 import os
 import re
 
+# Number of full (CPU-reference) validation passes used to detect a kernel that
+# is only *sometimes* correct. See check_determinism().
+DEFAULT_DETERMINISM_RUNS = 3
+
 # Relative tolerance for numerical drift between the GPU kernel and the CPU
 # reference. float32 reassociation over a length-K reduction accumulates an
 # error on the order of sqrt(K) * eps * magnitude, so the 1e-4 the generated
@@ -60,12 +64,18 @@ def run_validation(
     if not os.path.exists(abs_binary):
         return False, f"Executable not found at {abs_binary}"
 
+    # BENCH_ONLY makes a kernel skip its CPU reference (see benchmarker). It must
+    # never be set for a correctness run, or we'd "validate" a kernel that never
+    # actually compared itself against anything.
+    env = {k: v for k, v in os.environ.items() if k != "BENCH_ONLY"}
+
     try:
         result = subprocess.run(
             [abs_binary],
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
 
         output = result.stdout.strip() + "\n" + result.stderr.strip()
@@ -113,3 +123,47 @@ def run_validation(
         )
     except Exception as e:
         return False, f"Unexpected validation error: {str(e)}"
+
+
+def check_determinism(
+    executable_path: str,
+    runs: int = DEFAULT_DETERMINISM_RUNS,
+    timeout: int = DEFAULT_TIMEOUT,
+    rel_tol: float = DEFAULT_REL_TOL,
+) -> tuple[bool, str]:
+    """
+    Re-run the FULL correctness check several times to catch a kernel that is
+    only sometimes right -- the signature of a race condition (e.g. a missing
+    __syncthreads, or threads exiting early past a barrier).
+
+    Why this exists as its own function rather than as a flag on benchmark():
+    the timed runs deliberately set BENCH_ONLY=1, which tells the kernel to skip
+    its CPU reference. A kernel that honours that flag prints no SUCCESS/FAILURE
+    token at all, so scanning timed-run output for a failure token can never
+    detect anything. Determinism therefore has to be established here, on real
+    validation runs with the CPU reference enabled.
+
+    Returns (True, msg) if every run passed, (False, reason) on the first
+    disagreement.
+    """
+    if runs <= 1:
+        return True, "determinism check skipped (runs <= 1)"
+
+    diffs = []
+    for i in range(1, runs + 1):
+        ok, msg = run_validation(executable_path, timeout=timeout, rel_tol=rel_tol)
+        if not ok:
+            return False, (
+                f"Nondeterministic correctness: run {i}/{runs} failed after an "
+                f"earlier run passed. Likely a race condition (check __syncthreads "
+                f"placement and shared-memory writes).\n{msg}"
+            )
+        m = re.search(r"max DIFF=([0-9eE.+\-]+)", msg)
+        if m:
+            diffs.append(m.group(1))
+
+    # Identical inputs are regenerated per run only if the harness seeds RNG by
+    # time, so differing DIFFs are not proof of a bug -- but all runs passing is
+    # the property we need.
+    detail = f" (max DIFF across runs: {', '.join(diffs)})" if diffs else ""
+    return True, f"Deterministic across {runs} validation runs{detail}."

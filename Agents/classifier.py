@@ -12,9 +12,11 @@ strategy list, which means "planner has full freedom" — the pipeline must
 behave exactly as it did before this agent existed. It can prune, never block.
 """
 import csv
-import json
 from pathlib import Path
 from datetime import datetime
+
+from Agents.json_utils import extract_json
+from Agents.providers import LLMProvider
 
 
 # ── Strategy taxonomy ──────────────────────────────────────────────────
@@ -85,20 +87,6 @@ def bottleneck_from_metrics(metrics: dict) -> str:
     return "memory-bound" if dram > comp else "compute-bound"
 
 
-def _extract_json(text: str):
-    """Best-effort parse of a single JSON object out of an LLM response."""
-    if not text:
-        return None
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        return None
-    try:
-        return json.loads(text[start:end + 1])
-    except Exception:
-        return None
-
-
 def _clean_strategies(raw_list, kernel_type: str) -> list[str]:
     """
     Ground the LLM's suggested strategies against the known vocabulary and top
@@ -155,10 +143,8 @@ class ClassifierAgent:
     """One-shot kernel classifier. Never raises into the pipeline — any failure
     degrades to a low-confidence "other" classification (no pruning applied)."""
 
-    def __init__(self, safe_chat_fn, runner, user_id: str, session_id: str):
-        self.safe_chat = safe_chat_fn
-        self.runner = runner
-        self.user_id = user_id
+    def __init__(self, provider: LLMProvider, session_id: str = "classifier"):
+        self.provider = provider
         self.session_id = session_id
 
     def _fallback(self, metrics: dict) -> dict:
@@ -181,12 +167,12 @@ class ClassifierAgent:
         )
 
         try:
-            raw = await self.safe_chat(prompt, self.runner, self.user_id, self.session_id)
+            raw = await self.provider.complete(prompt, session_id=self.session_id)
         except Exception as e:
             print(f"    [classifier] LLM call failed: {e}")
             raw = ""
 
-        data = _extract_json(raw)
+        data = extract_json(raw)
         if not data:
             return self._fallback(metrics)
 

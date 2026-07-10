@@ -4,25 +4,34 @@ Headless experiment runner for KARMA.
 Runs optimization loop on KernelBench / SGLang / own kernels.
 Saves results to CSV after every kernel (crash-safe).
 
+Each agent (coder / classifier / planner / reflector) is an independent class
+with its own prompt, its own LLM provider and its own session id, all configured
+in karma.yaml — so they can run on different models/vendors and never share
+conversation context.
+
 optimize_one() flow (per kernel):
-  pre_flight (ncu metrics)
+  pre_flight (ncu metrics; Redis cache is best-effort and never load-bearing)
+    → baseline benchmark (mean ± std over TIMED_RUNS)
     → ClassifierAgent.classify()   [once, if USE_CLASSIFIER]  — soft prior:
         kernel_type / bottleneck / preferred_strategies / confidence
         (also logged to results/classifier_log.csv for offline accuracy scoring)
-    → baseline benchmark (mean ± std over TIMED_RUNS)
     → KB.retrieve()                keyed by kernel_type to sharpen retrieval
     → round loop (1..ROUNDS):
         PlanningAgent.plan()       [each round, if USE_PLANNER] — turns the
             prior + metrics + KB + history into ONE concrete strategy+changes;
             free to choose "other" (escape hatch — prior is never a hard filter)
-          → CoderAgent generates the .cu (told to implement the plan exactly,
+          → CoderAgent.optimize() emits the .cu (implements the plan exactly,
             or freeform if planner disabled)
-          → compile → dims_match gate → validate → benchmark (stability check)
+          → GATES, cheapest first, each short-circuiting the round:
+              compile → dims_match (regex, µs) → validate (runs CPU ref)
+              → check_determinism (N full re-runs; catches races)
+              → benchmark (baseline re-measured back-to-back; mean ± std)
           → reflect → KB.store; failed strategy names feed the next plan's avoid
     → best kernel + metrics written to results/experiments.csv
 
 Ablation flags: --no-kb  --no-reflect  --no-classifier  --no-planner
-Disabling both new agents reproduces the original pipeline exactly.
+Disabling the classifier and planner reproduces the original pipeline.
+Config:         --config <file.yaml>   (default: karma.yaml)
 """
 from dotenv import load_dotenv
 load_dotenv()
@@ -40,18 +49,22 @@ from pydantic import BaseModel
 # pipeline
 from pipeline.compiler import compile_cuda
 from pipeline.pre_flight import pre_flight
-from pipeline.validator import run_validation
+from pipeline.validator import run_validation, check_determinism
 from pipeline.benchmarker import benchmark
 from pipeline.dims import dims_match
 
-# agent
-from Agents.coder import safe_chat, runner, USER_ID, SESSION_ID
+# config + providers (LLM-agnostic: each agent picks its own provider/model)
+from config import load_config, ConfigError
+from Agents.providers import build_provider
+
+# agents — each owns its class, prompt, provider and session id
+from Agents.coder import CoderAgent
 from Agents.classifier import ClassifierAgent, append_classifier_log
 from Agents.planner import PlanningAgent
 
 # knowledge (novel contribution)
 from knowledge.store import KnowledgeBase
-from knowledge.reflector import reflect
+from knowledge.reflector import ReflectorAgent
 
 # ── Config ─────────────────────────────────────────────────────────────
 RESULTS_CSV  = "results/experiments.csv"
@@ -59,16 +72,50 @@ ROUNDS       = 3        # 3 for lab sessions, 5 for paper runs
 WARMUP_RUNS  = 3
 TIMED_RUNS   = 10
 TIMEOUT_SEC  = 10
-GPU_ARCH     = "sm_86"
+DETERMINISM_RUNS = 3    # full CPU-reference re-runs used to catch race conditions
+
+# Ask the driver rather than hardcoding: prompts previously said "sm_86 / RTX
+# A4000 Ampere" while compile_cuda auto-detected the real arch (sm_89 / Ada on
+# this box), so the coder was tuning for hardware that wasn't there.
+try:
+    from pipeline.compiler import get_gpu_arch
+    GPU_ARCH = get_gpu_arch()
+except Exception:
+    GPU_ARCH = "sm_86"
+CONFIG_PATH  = "karma.yaml"
 USE_KB         = True    # set False for ablation: no knowledge base
 USE_REFLECT    = True    # set False for ablation: no reflection agent
 USE_CLASSIFIER = True    # set False for ablation: no per-kernel classification
 USE_PLANNER    = True    # set False for ablation: no per-round planning
 
 # ── Initialize KnowledgeBase + agents ──────────────────────────────────
+# Each agent gets its OWN provider (from karma.yaml) and its OWN session id, so
+# they can run on different models and never share conversation context.
 kb = KnowledgeBase() if USE_KB else None
-classifier = ClassifierAgent(safe_chat, runner, USER_ID, SESSION_ID) if USE_CLASSIFIER else None
-planner = PlanningAgent(safe_chat, runner, USER_ID, SESSION_ID) if USE_PLANNER else None
+coder = classifier = planner = reflector = None
+
+
+def build_agents(config_path: str = CONFIG_PATH) -> None:
+    """Construct every agent from karma.yaml. Fails fast on misconfiguration."""
+    global coder, classifier, planner, reflector
+
+    try:
+        cfg = load_config(config_path)
+    except ConfigError as e:
+        print(f"\n  CONFIG ERROR: {e}\n")
+        raise SystemExit(1)
+
+    print("  LLM config:")
+    for agent_name in ("coder", "classifier", "planner", "reflector"):
+        print(f"    {agent_name:11} {cfg.for_agent(agent_name).redacted()}")
+
+    coder = CoderAgent(build_provider(cfg.for_agent("coder")), session_id="coder")
+    if USE_CLASSIFIER:
+        classifier = ClassifierAgent(build_provider(cfg.for_agent("classifier")), session_id="classifier")
+    if USE_PLANNER:
+        planner = PlanningAgent(build_provider(cfg.for_agent("planner")), session_id="planner")
+    if USE_REFLECT:
+        reflector = ReflectorAgent(build_provider(cfg.for_agent("reflector")), session_id="reflector")
 
 
 # ── Pydantic result schema ─────────────────────────────────────────────
@@ -102,22 +149,6 @@ class ExperimentResult(BaseModel):
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
-def extract_cuda_code(text: str) -> str:
-    # strip markdown fences and "cppcopy" artifacts
-    for fence in ["```cpp", "```cuda", "```c", "cppcopy", "```"]:
-        if fence in text:
-            after = text.split(fence, 1)[1]
-            end = after.find("```")
-            text = after[:end] if end != -1 else after
-            break
-    # find actual CUDA start
-    if "#include" in text:
-        return text[text.find("#include"):].strip()
-    if "__global__" in text:
-        return text[text.find("__global__"):].strip()
-    return text.strip()
-
-
 def append_result(row: dict):
     """
     Append one result row, keyed by column name rather than position.
@@ -173,6 +204,20 @@ def safe_float(val, default=0.0) -> float:
         return float(str(val).replace("%", "").strip())
     except Exception:
         return default
+
+
+async def _reflect_and_store(*, kernel_name, bottleneck, round_num, code, result,
+                             speedup=0.0, error=""):
+    """Reflect on one round's outcome and persist the insight. No-op if the
+    reflector or the KB is disabled (ablation)."""
+    if not (USE_REFLECT and reflector and kb):
+        return
+    insight = await reflector.reflect(
+        kernel_name=kernel_name, bottleneck=bottleneck, round_num=round_num,
+        code=code, result=result, speedup=speedup, error=error,
+    )
+    kb.store(insight)
+    print(f"    KB stored: {insight['strategy_used'][:50]}")
 
 
 # ── Core optimization loop ─────────────────────────────────────────────
@@ -335,41 +380,18 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         else:
             guidance = f"{strategy_hint}\n\n"
 
-        prompt = (
-            f"You are a CUDA expert optimizing for RTX A4000 ({GPU_ARCH} Ampere).\n"
-            f"Round {r} of {ROUNDS}.\n\n"
-            f"{guidance}"
-            f"{metrics_ctx}"
-            f"{kb_ctx}"
-            f"{history_ctx}"
-            f"{best_ctx}"
-            f"HARD CONSTRAINTS:\n"
-            f"- float32 only. No half / half2 / __half / fp16.\n"
-            f"- No cuda/cmath, no std::complex headers.\n"
-            f"- Apply ONE focused optimization per round.\n"
-            f"- If previous round had a compile error, fix THAT error first.\n"
-            f"- PRESERVE THE HARNESS: keep main(), the CPU reference, the\n"
-            f"  'GPU Time: %f' print, the 'DIFF=%e' print and the SUCCESS/FAILURE\n"
-            f"  logic and its problem dimensions EXACTLY as given. Optimize only the\n"
-            f"  device kernel(s) and their launch config — never delete or weaken\n"
-            f"  the verification, and never change the tolerance to force a pass.\n"
-            f"- Do NOT change any problem-size constant (N, N_TEST, dimensions, matrix\n"
-            f"  size, etc.) from the given kernel. This is checked automatically —\n"
-            f"  any round that shrinks or grows the problem size is rejected outright,\n"
-            f"  no matter how fast it measures.\n"
-            f"- If the given kernel already reads the BENCH_ONLY environment variable\n"
-            f"  to skip its CPU reference, keep that check intact — do not remove it\n"
-            f"  or change its behavior.\n\n"
-            f"OUTPUT RULES — no exceptions:\n"
-            f"- Return ONLY the raw .cu file.\n"
-            f"- First character must be '#' (from #include).\n"
-            f"- No markdown, no backticks, no explanation.\n"
-            f"- Must compile: nvcc -O2 -arch={GPU_ARCH} -lcublas -lcurand\n\n"
-            f"KERNEL TO OPTIMIZE:\n{best_code}"
-        )
-
-        raw = await safe_chat(prompt, runner, USER_ID, SESSION_ID)
-        optimized = extract_cuda_code(raw)
+        # The prompt (hard constraints, harness contract, output rules) lives in
+        # CoderAgent — this loop only supplies context.
+        try:
+            optimized = await coder.optimize(
+                best_code,
+                round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
+                guidance=guidance, metrics_ctx=metrics_ctx,
+                kb_ctx=kb_ctx, history_ctx=history_ctx, best_ctx=best_ctx,
+            )
+        except Exception as e:
+            print(f"  round {r}: coder call failed — {e}")
+            optimized = ""
 
         if not optimized or len(optimized) < 30:
             print(f"  round {r}: invalid/empty output — skipping")
@@ -394,14 +416,32 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
                 + f"\n\n{optimized}"
             )
             # reflect on failure
-            if USE_REFLECT and kb:
-                insight = await reflect(
-                    safe_chat, runner, USER_ID, SESSION_ID,
-                    kernel_name=name, bottleneck=hint, round_num=r,
-                    code=optimized, result="compile_failed", error=err
-                )
-                kb.store(insight)
-                print(f"    KB stored: {insight['strategy_used'][:50]}")
+            await _reflect_and_store(
+                kernel_name=name, bottleneck=hint, round_num=r,
+                code=optimized, result="compile_failed", error=err,
+            )
+            continue
+
+        # ── problem-size equivalence gate ───────────────────────────
+        # A kernel can pass validation yet still be "faster" only because it
+        # quietly shrank the problem (e.g. N_TEST). This is a regex over the
+        # source (microseconds) whereas run_validation() executes the binary and
+        # a single-threaded CPU reference (seconds-to-minutes), so it runs first.
+        dims_ok, dims_msg = dims_match(source, optimized)
+        if not dims_ok:
+            print(f"  round {r}: PROBLEM-SIZE MISMATCH — {dims_msg}")
+            history.append({"round": r, "result": "dims_mismatch", "error": dims_msg, "strategy": current_strategy})
+            best_code = (
+                f"// REJECTED — you changed the problem dimensions: {dims_msg}\n"
+                f"// Dimensions must stay IDENTICAL to the baseline. A smaller\n"
+                f"// problem is not a valid optimization and is checked automatically.\n"
+                f"// (Tuning knobs like TILE_SIZE/BLOCK_DIM ARE free to change.)\n\n"
+                + optimized
+            )
+            await _reflect_and_store(
+                kernel_name=name, bottleneck=hint, round_num=r,
+                code=optimized, result="dims_mismatch", error=dims_msg,
+            )
             continue
 
         # ── validate ───────────────────────────────────────────────
@@ -418,38 +458,33 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
                 f"// Fix the math. Do not restructure the kernel.\n\n"
                 + optimized
             )
-            if USE_REFLECT and kb:
-                insight = await reflect(
-                    safe_chat, runner, USER_ID, SESSION_ID,
-                    kernel_name=name, bottleneck=hint, round_num=r,
-                    code=optimized, result="validation_failed", error=msg
-                )
-                kb.store(insight)
-                print(f"    KB stored: {insight['strategy_used'][:50]}")
+            await _reflect_and_store(
+                kernel_name=name, bottleneck=hint, round_num=r,
+                code=optimized, result="validation_failed", error=msg,
+            )
             continue
 
-        # ── problem-size equivalence gate ───────────────────────────
-        # A kernel can pass validation yet still be "faster" only because it
-        # quietly shrank the problem (e.g. N_TEST). Reject that before it
-        # ever reaches the benchmark, rather than trusting the prompt alone.
-        dims_ok, dims_msg = dims_match(source, optimized)
-        if not dims_ok:
-            print(f"  round {r}: PROBLEM-SIZE MISMATCH — {dims_msg}")
-            history.append({"round": r, "result": "dims_mismatch", "error": dims_msg, "strategy": current_strategy})
+        # ── determinism gate ───────────────────────────────────────
+        # Passing validation once proves nothing about a racy kernel. Re-run the
+        # full CPU-reference check a few times; a kernel that only sometimes
+        # agrees is not a result, however fast it measures.
+        print(f"  round {r}: checking determinism...")
+        det_ok, det_msg = check_determinism(result, runs=DETERMINISM_RUNS)
+        if not det_ok:
+            print(f"  round {r}: UNSTABLE — {str(det_msg)[:70]}")
+            history.append({"round": r, "result": "unstable", "strategy": current_strategy})
             best_code = (
-                f"// REJECTED — you changed the problem dimensions: {dims_msg}\n"
-                f"// Dimensions must stay IDENTICAL to the baseline. A smaller\n"
-                f"// problem is not a valid optimization and is checked automatically.\n\n"
+                "// REJECTED — this kernel passed validation once but failed a\n"
+                "// repeat run, so it is not deterministically correct (race\n"
+                "// condition). Every thread in a block must reach every\n"
+                "// __syncthreads(); never return early before a barrier.\n"
+                f"// Detail: {str(det_msg)[:200]}\n\n"
                 + optimized
             )
-            if USE_REFLECT and kb:
-                insight = await reflect(
-                    safe_chat, runner, USER_ID, SESSION_ID,
-                    kernel_name=name, bottleneck=hint, round_num=r,
-                    code=optimized, result="dims_mismatch", error=dims_msg
-                )
-                kb.store(insight)
-                print(f"    KB stored: {insight['strategy_used'][:50]}")
+            await _reflect_and_store(
+                kernel_name=name, bottleneck=hint, round_num=r,
+                code=optimized, result="unstable", error=str(det_msg)[:200],
+            )
             continue
 
         # ── benchmark ──────────────────────────────────────────────
@@ -468,28 +503,10 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         opt_ms = opt_stats["mean_ms"]
 
         if not opt_stats["stable"]:
-            # Passed run_validation() once, then printed a failure token on a
-            # later timed run — it's not deterministically correct (likely a
-            # race condition), so its "speed" isn't a real result.
-            print(f"  round {r}: UNSTABLE — kernel failed its own check on a later "
-                  f"timed run (nondeterministic) — discarding")
-            history.append({"round": r, "result": "unstable", "strategy": current_strategy})
-            best_code = (
-                "// REJECTED — this kernel passed validation once but printed a\n"
-                "// FAILURE/MISMATCH token on a later timed run, so it is not\n"
-                "// deterministically correct (likely a race condition). Fix the\n"
-                "// synchronization — don't just resubmit the same kernel.\n\n"
-                + optimized
-            )
-            if USE_REFLECT and kb:
-                insight = await reflect(
-                    safe_chat, runner, USER_ID, SESSION_ID,
-                    kernel_name=name, bottleneck=hint, round_num=r,
-                    code=optimized, result="unstable", error="nondeterministic correctness"
-                )
-                kb.store(insight)
-                print(f"    KB stored: {insight['strategy_used'][:50]}")
-            continue
+            # Belt-and-braces only: fires for legacy kernels that ignore
+            # BENCH_ONLY and still print their SUCCESS/FAILURE token on timed
+            # runs. Real race detection already happened in check_determinism().
+            print(f"  round {r}: WARNING — a timed run printed a failure token")
 
         if opt_ms <= 0 or baseline_ms <= 0:
             print(f"  round {r}: benchmark returned 0 — binary may not print 'GPU Time'")
@@ -517,14 +534,10 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             best_code = source
 
         # reflect on success
-        if USE_REFLECT and kb:
-            insight = await reflect(
-                safe_chat, runner, USER_ID, SESSION_ID,
-                kernel_name=name, bottleneck=hint, round_num=r,
-                code=optimized, result="success", speedup=speedup
-            )
-            kb.store(insight)
-            print(f"    KB stored: {insight['strategy_used'][:50]}")
+        await _reflect_and_store(
+            kernel_name=name, bottleneck=hint, round_num=r,
+            code=optimized, result="success", speedup=speedup,
+        )
 
         # convergence check
         successes = [h for h in history if h.get("result") == "success"]
@@ -633,41 +646,12 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
 
         pytorch_code = py_file.read_text()
 
-        # enforce GPU Time output format in baseline generation
-        cuda_prompt = (
-            f"Convert this PyTorch operation to a standalone CUDA kernel for RTX A4000 (sm_86).\n\n"
-            f"PYTORCH REFERENCE:\n{pytorch_code}\n\n"
-            f"MANDATORY REQUIREMENTS:\n"
-            f"- Complete standalone .cu file with main()\n"
-            f"- Use cudaEvent_t for timing. Print EXACTLY: printf(\"GPU Time: %f ms\\n\", elapsed_ms);\n"
-            f"- float32 only. No half types.\n"
-            f"- Start with #include, no markdown, no backticks\n"
-            f"- Must compile: nvcc -O2 -arch=sm_86 -lcublas -lcurand\n\n"
-            f"CORRECTNESS HARNESS (follow exactly):\n"
-            f"- Keep problem dimensions MODERATE so the single-threaded CPU reference\n"
-            f"  finishes in a few seconds and host allocations stay under ~1GB. For a\n"
-            f"  reduction/matmul, keep the reduction dimension <= 512 and total output\n"
-            f"  <= ~4M elements. Do NOT use production-scale dims (no multi-GB tensors).\n"
-            f"- Do the naive CPU reference ONCE, then compare GPU vs CPU by the RELATIVE\n"
-            f"  error: rel = fabs(gpu-cpu) / fmaxf(1e-6f, fabsf(cpu)). Track max_rel.\n"
-            f"- Because GPU and CPU accumulate reductions in different orders, use a\n"
-            f"  RELATIVE tolerance that scales with reduction depth K:\n"
-            f"      float tol = 1e-4f * sqrtf((float)K);   // K = length of the reduction, min 1\n"
-            f"- To keep the CPU cheap at scale, you MAY verify a bounded SAMPLE of output\n"
-            f"  elements (e.g. up to 4096 evenly-spaced indices) instead of every element.\n"
-            f"- Print EXACTLY one line:  printf(\"DIFF=%e\\n\", max_rel);\n"
-            f"- Then print SUCCESS if max_rel <= tol, else FAILURE.\n"
-            f"- At the very start of main(), check: if (getenv(\"BENCH_ONLY\") != NULL).\n"
-            f"  When set, SKIP the CPU reference computation and the DIFF/SUCCESS/FAILURE\n"
-            f"  prints entirely — still allocate, run the GPU kernel, and print the\n"
-            f"  'GPU Time: %f ms' line exactly as always. This lets the benchmark harness\n"
-            f"  time the kernel alone, over many repeated runs, without redoing the CPU-side\n"
-            f"  validation (which is only needed once, on a normal run).\n"
-        )
-
         print(f"  generating baseline CUDA from PyTorch...")
-        raw = await safe_chat(cuda_prompt, runner, USER_ID, SESSION_ID)
-        baseline_cuda = extract_cuda_code(raw)
+        try:
+            baseline_cuda = await coder.generate_baseline(pytorch_code, gpu_arch=GPU_ARCH)
+        except Exception as e:
+            print(f"  baseline generation failed — skipping: {e}")
+            continue
 
         if not baseline_cuda or not baseline_cuda.startswith("#include"):
             print(f"  failed to generate valid baseline — skipping")
@@ -735,12 +719,18 @@ if __name__ == "__main__":
         print("⚠  ABLATION MODE: ReflectionAgent disabled")
     if "--no-classifier" in sys.argv:
         USE_CLASSIFIER = False
-        classifier = None
         print("⚠  ABLATION MODE: ClassifierAgent disabled")
     if "--no-planner" in sys.argv:
         USE_PLANNER = False
-        planner = None
         print("⚠  ABLATION MODE: PlanningAgent disabled")
+
+    # optional: --config path/to/other.yaml
+    if "--config" in sys.argv:
+        CONFIG_PATH = sys.argv[sys.argv.index("--config") + 1]
+
+    print(f"\nGPU arch: {GPU_ARCH}")
+    build_agents(CONFIG_PATH)   # honours the ablation flags set above
+    print()
 
     if mode == "own":
         asyncio.run(run_own_kernels())
@@ -753,4 +743,4 @@ if __name__ == "__main__":
         asyncio.run(run_sglang(max_kernels=count))
     else:
         print("Usage: python run_experiments.py [own|kernelbench|sglang] [level] [max_kernels]")
-        print("Flags: --no-kb  --no-reflect  --no-classifier  --no-planner")
+        print("Flags: --no-kb  --no-reflect  --no-classifier  --no-planner  --config <file.yaml>")
