@@ -20,18 +20,21 @@ def benchmark(binary_path: str, warmup: int = 5, runs: int = 20, timeout: int = 
                             # this measurement was, so a caller can tell a
                             # real speedup from run-to-run jitter
         "n":       int,    # number of timed runs that produced a value
-        "stable":  bool,   # False if ANY timed run printed a failure token
+        "stable":  bool,   # see caveat below -- NOT the determinism check
       }
 
     BENCH_ONLY=1 is set in the child environment. Generated kernels are
     instructed (see run_experiments.py prompts) to skip their CPU-reference
-    recompute when it's set, so the 20 timed runs only pay for the GPU
-    kernel, not for re-validating on the CPU every pass -- that recompute is
-    what run_validation() is for, on its own single run. Kernels that don't
-    check the env var still work exactly as before (they just re-validate
-    every timed run too); either way every run's output is scanned for a
-    failure token, so a kernel that is only *sometimes* correct can't slip a
-    fast-but-wrong run into the average undetected.
+    recompute when it's set, so the timed runs only pay for the GPU kernel,
+    not for re-validating on the CPU every pass.
+
+    CAVEAT on `stable`: a kernel that honours BENCH_ONLY prints no
+    SUCCESS/FAILURE token at all, so this scan cannot detect anything for it --
+    `stable` will simply stay True. It is a best-effort net that only fires for
+    legacy kernels which ignore the env var. Real nondeterminism (race
+    conditions) is established by validator.check_determinism(), which re-runs
+    the full correctness check with the CPU reference enabled. Do not rely on
+    `stable` alone.
     """
     env = dict(os.environ, BENCH_ONLY="1")
 

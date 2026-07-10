@@ -61,10 +61,13 @@ def pre_flight(source_code : str)->dict:
     finally:
         if temp_dir_path.exists():
             temp_dir_path.unlink()
-        
-        executable_file = pathlib.Path(str(temp_dir_path).replace(".cu", ""))
-        if executable_file.exists():
-            executable_file.unlink()
+
+        # compile_cuda() appends ".exe" on Windows, so stripping ".cu" alone
+        # missed the real binary and leaked one per profiled kernel.
+        stem = str(temp_dir_path).replace(".cu", "")
+        for candidate in (pathlib.Path(stem), pathlib.Path(stem + ".exe")):
+            if candidate.exists():
+                candidate.unlink()
 
 if __name__ == '__main__':
     cu_file_path = '/home/lab/project_26/Multi_Agent_CUDA_optimization/kernels/sigmoid_kernel.cu'
