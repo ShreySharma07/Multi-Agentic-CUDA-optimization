@@ -1,0 +1,63 @@
+# karma.yaml — KARMA agent / LLM configuration
+#
+# Safe to commit: this file never holds a secret. Each agent names the ENV VAR
+# that carries its API key (`api_key_env`); the key itself lives in .env, which
+# is gitignored.
+#
+# Every agent is independent: it may use a different provider, model, and key
+# from every other agent. Anything omitted under `agents:` falls back to
+# `defaults:`.
+#
+# Supported providers (SDK installed on demand — you only need the one you use):
+#   gemini     -> pip install google-genai        (installed)
+#   openai     -> pip install openai
+#   anthropic  -> pip install anthropic
+#   ollama     -> local server, no SDK, no API key
+#
+# Model id examples
+#   gemini:    gemini-2.5-flash, gemini-2.5-pro
+#   anthropic: claude-opus-4-8, claude-sonnet-5, claude-haiku-4-5-20251001
+#   openai:    gpt-4o, gpt-4o-mini
+#   ollama:    llama3.1, qwen2.5-coder:32b
+
+defaults:
+  provider: gemini
+  model: gemini-2.5-flash
+  api_key_env: GOOGLE_API_KEY   # must match the name used in your .env
+  temperature: 0.2
+  max_retries: 5
+  timeout: 120
+
+agents:
+  # Writes the CUDA. The expensive, quality-critical role — give it your
+  # strongest model.
+  coder:
+    model: gemini-2.5-flash
+    temperature: 0.2
+
+  # One cheap call per kernel. Classification is an easy task; don't pay for it.
+  classifier:
+    model: gemini-2.5-flash
+    temperature: 0.0        # deterministic labels
+
+  # One call per round. Benefits from reasoning, but the output is short.
+  planner:
+    model: gemini-2.5-flash
+    temperature: 0.3        # a little exploration across rounds
+
+  # Summarises each round into a KB insight. Cheap and high-volume.
+  reflector:
+    model: gemini-2.5-flash
+    temperature: 0.0
+
+# --- Mixing providers is the point. For example: ---
+#
+# agents:
+#   coder:
+#     provider: anthropic
+#     model: claude-opus-4-8
+#     api_key_env: ANTHROPIC_API_KEY   # then put ANTHROPIC_API_KEY=... in .env
+#   classifier:
+#     provider: ollama
+#     model: qwen2.5-coder:32b
+#     base_url: http://localhost:11434

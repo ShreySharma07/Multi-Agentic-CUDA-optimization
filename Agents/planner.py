@@ -13,7 +13,9 @@ before this agent existed.
 """
 import json
 
-from Agents.classifier import ALL_STRATEGIES, _extract_json
+from Agents.classifier import ALL_STRATEGIES
+from Agents.json_utils import extract_json
+from Agents.providers import LLMProvider
 
 
 PLAN_PROMPT = """You are a CUDA optimization planner. Choose ONE strategy for the coder to
@@ -93,10 +95,8 @@ class PlanningAgent:
     """Per-round strategy planner. Never raises into the pipeline — any failure
     degrades to a full-freedom 'agent_choice' plan."""
 
-    def __init__(self, safe_chat_fn, runner, user_id: str, session_id: str):
-        self.safe_chat = safe_chat_fn
-        self.runner = runner
-        self.user_id = user_id
+    def __init__(self, provider: LLMProvider, session_id: str = "planner"):
+        self.provider = provider
         self.session_id = session_id
 
     def _fallback(self) -> dict:
@@ -146,12 +146,12 @@ class PlanningAgent:
         )
 
         try:
-            raw = await self.safe_chat(prompt, self.runner, self.user_id, self.session_id)
+            raw = await self.provider.complete(prompt, session_id=self.session_id)
         except Exception as e:
             print(f"    [planner] LLM call failed: {e}")
             raw = ""
 
-        data = _extract_json(raw)
+        data = extract_json(raw)
         if not data:
             return self._fallback()
 
