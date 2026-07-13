@@ -27,7 +27,6 @@ class AnthropicProvider(LLMProvider):
         resp = await self._client.messages.create(
             model=self.model,
             max_tokens=self.max_tokens,
-            temperature=self.temperature,
             messages=[{"role": "user", "content": prompt}],
         )
         # content is a list of blocks; concatenate the text ones

@@ -9,28 +9,39 @@ with its own prompt, its own LLM provider and its own session id, all configured
 in karma.yaml — so they can run on different models/vendors and never share
 conversation context.
 
-optimize_one() flow (per kernel):
-  pre_flight (ncu metrics; Redis cache is best-effort and never load-bearing)
-    → baseline benchmark (mean ± std over TIMED_RUNS)
-    → ClassifierAgent.classify()   [once, if USE_CLASSIFIER]  — soft prior:
-        kernel_type / bottleneck / preferred_strategies / confidence
-        (also logged to results/classifier_log.csv for offline accuracy scoring)
-    → KB.retrieve()                keyed by kernel_type to sharpen retrieval
-    → round loop (1..ROUNDS):
-        PlanningAgent.plan()       [each round, if USE_PLANNER] — turns the
-            prior + metrics + KB + history into ONE concrete strategy+changes;
-            free to choose "other" (escape hatch — prior is never a hard filter)
-          → CoderAgent.optimize() emits the .cu (implements the plan exactly,
-            or freeform if planner disabled)
-          → GATES, cheapest first, each short-circuiting the round:
-              compile → dims_match (regex, µs) → validate (runs CPU ref)
-              → check_determinism (N full re-runs; catches races)
-              → benchmark (baseline re-measured back-to-back; mean ± std)
-          → reflect → KB.store; failed strategy names feed the next plan's avoid
-    → best kernel + metrics written to results/experiments.csv
+TWO EVALUATION PATHS
+--------------------
+kernelbench  → torch-extension evaluation (CUDA Agent methodology). Python owns
+               the inputs, the PyTorch correctness oracle and the clock; the LLM
+               writes ONLY {cuda_source, cpp_source}. The model cannot shrink the
+               problem, weaken a tolerance, or grade itself — so dims_match,
+               BENCH_ONLY and check_determinism are not needed here and are not
+               used. See pipeline/torch_eval.py.
+own, sglang  → legacy standalone-.cu path, unchanged (self-contained program with
+               main(), its own CPU reference and timing).
+
+optimize_one_torch() flow (per kernelbench task):
+  load_task()            import the KernelBench module (Model/get_inputs)
+    → probe_task()       does it fit in VRAM? if not, SKIP before spending any
+                         tokens (Windows silently pages past VRAM into system RAM,
+                         which produces plausible timings that only measure PCIe)
+    → measure_baselines()  PyTorch eager, and torch.compile when available
+                           (unavailable on Windows: triton has no wheel)
+    → ROUND 0: coder.translate() → compile → validate, up to translate_retries
+    → ext pre-flight     ncu on the round-0 kernel → occupancy/dram/compute
+                         (degrades to bottleneck="unknown" on ERR_NVGPUCTRPERM)
+    → classify (soft prior) → KB.retrieve keyed by kernel_type
+    → rounds 1..ROUNDS:
+        plan → coder.optimize() → compile_extension
+          → validate   (Gate A: correct vs PyTorch on 3 seeds;
+                        Gate B: deterministic — catches races)
+          → benchmark_interleaved  (eager vs karma, interleaved to cancel drift)
+          → reflect → KB.store; failed strategy feeds the next plan's avoid list
+        early stop when speedup_vs_compile >= target (target_met)
+    → best kernel → kernels/results/{task}.cu + {task}_binding.cpp
+    → row → results/experiments.csv
 
 Ablation flags: --no-kb  --no-reflect  --no-classifier  --no-planner
-Disabling the classifier and planner reproduces the original pipeline.
 Config:         --config <file.yaml>   (default: karma.yaml)
 """
 from dotenv import load_dotenv
@@ -52,6 +63,11 @@ from pipeline.pre_flight import pre_flight
 from pipeline.validator import run_validation, check_determinism
 from pipeline.benchmarker import benchmark
 from pipeline.dims import dims_match
+from pipeline.torch_eval import (
+    load_task, probe_task, measure_baselines, compile_extension,
+    validate as validate_ext, benchmark_interleaved, extension_name,
+)
+from pipeline.ext_profiler import profile_extension
 
 # config + providers (LLM-agnostic: each agent picks its own provider/model)
 from config import load_config, ConfigError
@@ -93,11 +109,12 @@ USE_PLANNER    = True    # set False for ablation: no per-round planning
 # they can run on different models and never share conversation context.
 kb = KnowledgeBase() if USE_KB else None
 coder = classifier = planner = reflector = None
+EVAL = None   # EvalSettings from karma.yaml; populated by build_agents()
 
 
 def build_agents(config_path: str = CONFIG_PATH) -> None:
     """Construct every agent from karma.yaml. Fails fast on misconfiguration."""
-    global coder, classifier, planner, reflector
+    global coder, classifier, planner, reflector, EVAL
 
     try:
         cfg = load_config(config_path)
@@ -105,6 +122,7 @@ def build_agents(config_path: str = CONFIG_PATH) -> None:
         print(f"\n  CONFIG ERROR: {e}\n")
         raise SystemExit(1)
 
+    EVAL = cfg.eval
     print("  LLM config:")
     for agent_name in ("coder", "classifier", "planner", "reflector"):
         print(f"    {agent_name:11} {cfg.for_agent(agent_name).redacted()}")
@@ -138,14 +156,27 @@ class ExperimentResult(BaseModel):
     rounds_total:         int   = 0
     compile_failures:     int   = 0
     validation_failures:  int   = 0
-    dims_mismatches:      int   = 0  # rounds rejected for changing problem size
-    unstable_rounds:      int   = 0  # rounds that failed their own check on a timed run
+    dims_mismatches:      int   = 0  # legacy path only (torch path can't be cheated this way)
+    unstable_rounds:      int   = 0  # rounds rejected as nondeterministic
     kb_entries_used:      int   = 0
     kernel_type:              str = ""   # ClassifierAgent label
     classifier_confidence:    str = ""   # high | medium | low
     strategies_tried:         str = ""   # semicolon-joined per-round strategy names
     planner_used_other_count: int = 0    # rounds where the planner went off-taxonomy
     pytorch_ref:          Optional[str] = None
+
+    # ── torch-extension path ───────────────────────────────────────────
+    status:               str   = "ok"   # ok | translate_failed | skipped_oom | error
+    eager_ms:             float = 0.0    # PyTorch eager baseline
+    eager_std:            float = 0.0
+    compile_ms:           Optional[float] = None   # torch.compile (None on Windows: no triton)
+    karma_ms:             float = 0.0    # best kernel
+    karma_std:            float = 0.0
+    speedup_vs_eager:     float = 0.0
+    speedup_vs_compile:   float = 0.0
+    target_met:           bool  = False  # beat torch.compile by the configured margin
+    translate_retries:    int   = 0      # round-0 attempts needed for a correct port
+    peak_gb:              float = 0.0    # peak GPU memory of the reference op
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
@@ -220,7 +251,263 @@ async def _reflect_and_store(*, kernel_name, bottleneck, round_num, code, result
     print(f"    KB stored: {insight['strategy_used'][:50]}")
 
 
-# ── Core optimization loop ─────────────────────────────────────────────
+# ── Torch-extension loop (kernelbench) ─────────────────────────────────
+async def optimize_one_torch(py_file: Path) -> dict:
+    """
+    CUDA Agent methodology: Python owns inputs, correctness and timing; the LLM
+    writes only the kernel + binding. See the module docstring for the flow.
+    """
+    name = py_file.stem
+    print(f"\n{'='*60}")
+    print(f"TASK: {name}")
+    print(f"{'='*60}")
+
+    row = dict(
+        timestamp=datetime.now().isoformat(),
+        kernel=f"{name}.cu",
+        source="kernelbench",
+        pytorch_ref=py_file.name,
+        bottleneck="unknown",
+    )
+
+    # ── load + VRAM feasibility (before spending a single token) ───────
+    try:
+        task = load_task(py_file)
+    except Exception as e:
+        print(f"  load failed: {e}")
+        return ExperimentResult(**row, status="error").model_dump()
+
+    fits, why, peak_gb = probe_task(task, headroom=EVAL.vram_headroom)
+    row["peak_gb"] = peak_gb
+    if not fits:
+        print(f"  SKIPPED — {why}")
+        return ExperimentResult(**row, status="skipped_oom").model_dump()
+
+    # ── baselines: PyTorch is the reference, not the LLM ───────────────
+    print("  measuring PyTorch baselines...")
+    base = measure_baselines(task, warmup=EVAL.warmup, runs=EVAL.runs)
+    eager_ms, compile_ms = base["eager_ms"], base["compile_ms"]
+    if not eager_ms or eager_ms <= 0:
+        return ExperimentResult(**row, status="error").model_dump()
+
+    row.update(eager_ms=eager_ms, eager_std=base["eager_std"], compile_ms=compile_ms)
+    cmp_txt = f"{compile_ms:.3f}ms" if compile_ms else "n/a"
+    print(f"  eager: {eager_ms:.3f}ms (±{base['eager_std']:.3f})  "
+          f"compile: {cmp_txt}  peak: {peak_gb:.2f}GB")
+
+    # ── ROUND 0: faithful translation ──────────────────────────────────
+    cuda_src = cpp_src = None
+    err_fb = ""
+    translate_retries = 0
+
+    for attempt in range(1, EVAL.translate_retries + 1):
+        print(f"  round 0 (translate) attempt {attempt}/{EVAL.translate_retries}...")
+        out = await coder.translate(task.source, gpu_arch=GPU_ARCH, error_feedback=err_fb)
+        if not out:
+            err_fb = "Your reply could not be parsed as the required JSON object."
+            translate_retries = attempt
+            continue
+
+        mod, cerr = compile_extension(
+            out["cuda_source"], out["cpp_source"], timeout_s=EVAL.compile_timeout_s
+        )
+        if mod is None:
+            print(f"    compile failed: {cerr.splitlines()[0][:70] if cerr else '?'}")
+            err_fb = f"COMPILER ERROR:\n{cerr[:2000]}"
+            translate_retries = attempt
+            continue
+
+        vok, vmsg = validate_ext(mod, task)
+        if not vok:
+            print(f"    incorrect: {vmsg[:70]}")
+            err_fb = f"VALIDATION FAILED:\n{vmsg}"
+            translate_retries = attempt
+            continue
+
+        cuda_src, cpp_src = out["cuda_source"], out["cpp_source"]
+        translate_retries = attempt
+        print(f"    translation correct ({vmsg})")
+        break
+
+    row["translate_retries"] = translate_retries
+    if cuda_src is None:
+        print(f"  TRANSLATE FAILED after {EVAL.translate_retries} attempts")
+        return ExperimentResult(**row, status="translate_failed").model_dump()
+
+    # baseline kernel timing (round 0 is the thing rounds 1..N must beat)
+    r0 = benchmark_interleaved(mod, task, warmup=EVAL.warmup, runs=EVAL.runs)
+    best_cuda, best_cpp = cuda_src, cpp_src
+    best_speedup = r0["speedup_vs_eager"]
+    best_ms, best_std, best_round = r0["karma_ms"], r0["karma_std"], 0
+    print(f"  round 0: {r0['karma_ms']:.3f}ms → {best_speedup:.2f}x vs eager")
+
+    # ── pre-flight: profile the round-0 kernel ─────────────────────────
+    print("  profiling (ncu)...")
+    occ = comp = dram = 0.0
+    hint = "unknown"
+    metrics_ctx = ""
+    pf = profile_extension(cuda_src, cpp_src, py_file, Path.cwd(), timeout_s=EVAL.ncu_timeout_s)
+    if pf.get("status") == "success":
+        m = pf["metrics"]
+        occ, comp, dram = (safe_float(m.get(k, 0)) for k in
+                           ("occupancy", "compute_throughput", "dram_throughput"))
+        hint = "memory-bound" if dram > comp else "compute-bound"
+        metrics_ctx = (
+            f"Hardware profile (Nsight Compute):\n"
+            f"  Occupancy: {occ}%\n  Compute throughput: {comp}%\n"
+            f"  DRAM throughput: {dram}%\n  Bottleneck: {hint}\n\n"
+        )
+        print(f"    occ={occ}% dram={dram}% → {hint}")
+    else:
+        print(f"    unavailable — {str(pf.get('error_message'))[:70]}")
+
+    row.update(bottleneck=hint, occupancy=occ, compute_throughput=comp, dram_throughput=dram)
+    metrics = {"occupancy": occ, "compute_throughput": comp, "dram_throughput": dram}
+
+    # ── classify (soft prior) ──────────────────────────────────────────
+    classification = None
+    if USE_CLASSIFIER and classifier:
+        classification = await classifier.classify(task.source, metrics)
+        print(f"  classifier: {classification['kernel_type']} / "
+              f"{classification['bottleneck']} / {classification['confidence']}")
+        append_classifier_log(f"{name}.cu", classification)
+        row["kernel_type"] = classification["kernel_type"]
+        row["classifier_confidence"] = classification["confidence"]
+
+    # ── KB retrieval ───────────────────────────────────────────────────
+    kb_ctx, kb_results = "", []
+    if USE_KB and kb:
+        key = classification["kernel_type"] if classification else name
+        kb_results = kb.retrieve(bottleneck=hint, kernel_name=key)
+        if kb_results:
+            kb_ctx = "Relevant past optimizations from KnowledgeBase:\n"
+            for p in kb_results:
+                kb_ctx += (f"  - {p.get('strategy_used','?')} → {p.get('speedup',0)}x. "
+                           f"Insight: {p.get('insight','?')}. Avoid if: {p.get('avoid_if','?')}\n")
+            kb_ctx += "\n"
+        print(f"  KB: {len(kb_results)} relevant entries")
+    row["kb_entries_used"] = len(kb_results)
+
+    # ── optimization rounds ────────────────────────────────────────────
+    history, planner_other, target_met = [], 0, False
+    err_fb = ""
+
+    for r in range(1, ROUNDS + 1):
+        history_ctx = ""
+        if history:
+            history_ctx = "Previous attempts this session:\n"
+            for h in history:
+                if h["result"] == "success":
+                    history_ctx += f"  Round {h['round']}: {h['strategy']} → {h['speedup']:.2f}x\n"
+                else:
+                    history_ctx += f"  Round {h['round']}: {h['strategy']} → FAILED ({h['result']})\n"
+            history_ctx += "\n"
+
+        best_ctx = f"Current best: {best_speedup:.2f}x vs eager — beat it.\n\n"
+
+        strategy = "agent_choice"
+        guidance = ""
+        if USE_PLANNER and planner:
+            plan = await planner.plan(classification, metrics, kb_results, history, best_speedup)
+            strategy = plan.get("strategy", "agent_choice")
+            if plan.get("strategy_is_other"):
+                planner_other += 1
+            guidance = ("Implement EXACTLY this plan. Do not choose a different strategy:\n"
+                        + json.dumps(plan, indent=2) + "\n\n")
+            print(f"  round {r}: plan → {strategy}")
+        else:
+            print(f"  round {r}: asking coder...")
+
+        out = await coder.optimize(
+            best_cuda, best_cpp,
+            round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
+            pytorch_source=task.source, guidance=guidance, metrics_ctx=metrics_ctx,
+            kb_ctx=kb_ctx, history_ctx=history_ctx, best_ctx=best_ctx,
+            error_feedback=err_fb,
+        )
+        if not out:
+            print(f"  round {r}: unparseable reply")
+            history.append({"round": r, "result": "empty_response", "strategy": strategy})
+            err_fb = "Your reply could not be parsed as the required JSON object."
+            continue
+
+        # compile
+        mod, cerr = compile_extension(
+            out["cuda_source"], out["cpp_source"], timeout_s=EVAL.compile_timeout_s
+        )
+        if mod is None:
+            print(f"  round {r}: COMPILE FAILED — {cerr.splitlines()[0][:60] if cerr else '?'}")
+            history.append({"round": r, "result": "compile_failed", "strategy": strategy})
+            err_fb = f"COMPILER ERROR:\n{cerr[:2000]}"
+            await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
+                                     code=out["cuda_source"], result="compile_failed",
+                                     error=cerr[:200])
+            continue
+
+        # correctness + determinism (PyTorch is the oracle)
+        vok, vmsg = validate_ext(mod, task)
+        if not vok:
+            kind = "unstable" if "ondeterministic" in vmsg else "validation_failed"
+            print(f"  round {r}: {kind.upper()} — {vmsg[:60]}")
+            history.append({"round": r, "result": kind, "strategy": strategy})
+            err_fb = f"VALIDATION FAILED:\n{vmsg}"
+            await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
+                                     code=out["cuda_source"], result=kind, error=vmsg[:200])
+            continue
+
+        # benchmark
+        b = benchmark_interleaved(mod, task, warmup=EVAL.warmup, runs=EVAL.runs)
+        speedup = b["speedup_vs_eager"]
+        vs_compile = (compile_ms / b["karma_ms"]) if (compile_ms and b["karma_ms"] > 0) else 0.0
+        err_fb = ""
+
+        cov = (b["karma_std"] / b["karma_ms"] * 100) if b["karma_ms"] else 0.0
+        print(f"  round {r}: ✓ {b['karma_ms']:.3f}ms (±{b['karma_std']:.3f}, {cov:.1f}% CoV) "
+              f"→ {speedup:.2f}x vs eager"
+              + (f", {vs_compile:.2f}x vs compile" if vs_compile else ""))
+        history.append({"round": r, "result": "success", "strategy": strategy, "speedup": speedup})
+
+        if speedup > best_speedup:
+            best_cuda, best_cpp = out["cuda_source"], out["cpp_source"]
+            best_speedup, best_ms, best_std, best_round = speedup, b["karma_ms"], b["karma_std"], r
+            Path("kernels/results").mkdir(parents=True, exist_ok=True)
+            Path(f"kernels/results/{name}.cu").write_text(best_cuda)
+            Path(f"kernels/results/{name}_binding.cpp").write_text(best_cpp)
+            print(f"    new best — saved kernels/results/{name}.cu")
+
+        await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
+                                 code=out["cuda_source"], result="success", speedup=speedup)
+
+        # early stop: beat torch.compile by the configured margin
+        if compile_ms and vs_compile >= EVAL.target_speedup_vs_compile:
+            print(f"  target met ({vs_compile:.2f}x >= {EVAL.target_speedup_vs_compile}x vs compile) — stopping")
+            target_met = True
+            break
+
+    # ── result ─────────────────────────────────────────────────────────
+    speedup_vs_compile = (compile_ms / best_ms) if (compile_ms and best_ms > 0) else 0.0
+    row.update(
+        best_ms=best_ms, best_ms_std=best_std, best_round=best_round,
+        karma_ms=best_ms, karma_std=best_std,
+        speedup_vs_eager=best_speedup, speedup_vs_compile=speedup_vs_compile,
+        best_speedup=best_speedup, target_met=target_met,
+        baseline_ms=eager_ms,
+        rounds_total=len(history),
+        compile_failures=sum(1 for h in history if h["result"] == "compile_failed"),
+        validation_failures=sum(1 for h in history if h["result"] == "validation_failed"),
+        unstable_rounds=sum(1 for h in history if h["result"] == "unstable"),
+        strategies_tried=";".join(h["strategy"] for h in history),
+        planner_used_other_count=planner_other,
+        status="ok",
+    )
+
+    print(f"\n  RESULT: {best_speedup:.2f}x vs eager"
+          + (f" | {speedup_vs_compile:.2f}x vs compile" if speedup_vs_compile else "")
+          + f" | round={best_round} | target_met={target_met}")
+    return ExperimentResult(**row).model_dump()
+
+
+# ── Core optimization loop (LEGACY: own/ and sglang/ standalone .cu) ────
 async def optimize_one(kernel_path: Path, source: str = None) -> dict:
     name   = kernel_path.name
     source = source or kernel_path.read_text()
@@ -383,7 +670,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
         # The prompt (hard constraints, harness contract, output rules) lives in
         # CoderAgent — this loop only supplies context.
         try:
-            optimized = await coder.optimize(
+            optimized = await coder.optimize_standalone(
                 best_code,
                 round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
                 guidance=guidance, metrics_ctx=metrics_ctx,
@@ -630,45 +917,21 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
         return
 
     files = sorted(kb_path.glob("*.py"))[:max_kernels]
-    print(f"Found {len(files)} kernels at {kb_path}")
-    Path("kernels/kernelbench").mkdir(parents=True, exist_ok=True)
-    Path("kernels/results").mkdir(exist_ok=True)
+    print(f"Found {len(files)} tasks at {kb_path}")
+    Path("kernels/results").mkdir(parents=True, exist_ok=True)
 
     for py_file in files:
-        cu_name = py_file.stem + ".cu"
-
-        if already_done(cu_name):
+        if already_done(py_file.stem + ".cu"):
             print(f"\n  already in CSV — skipping {py_file.name}")
             continue
 
-        print(f"\n{'='*60}")
-        print(f"KernelBench: {py_file.name}")
-
-        pytorch_code = py_file.read_text()
-
-        print(f"  generating baseline CUDA from PyTorch...")
         try:
-            baseline_cuda = await coder.generate_baseline(pytorch_code, gpu_arch=GPU_ARCH)
+            row = await optimize_one_torch(py_file)
         except Exception as e:
-            print(f"  baseline generation failed — skipping: {e}")
+            print(f"  ERROR on {py_file.name}: {e.__class__.__name__}: {e}")
             continue
 
-        if not baseline_cuda or not baseline_cuda.startswith("#include"):
-            print(f"  failed to generate valid baseline — skipping")
-            continue
-
-        cu_path = Path(f"kernels/kernelbench/{cu_name}")
-        cu_path.write_text(baseline_cuda)
-
-        ok, err = compile_cuda(str(cu_path))
-        if not ok:
-            print(f"  baseline compile failed — skipping: {str(err)[:80]}")
-            continue
-
-        print(f"  baseline compiled — optimizing...")
-        row = await optimize_one(cu_path, source=baseline_cuda)
-        row["source"]      = f"kernelbench_l{level}"
-        row["pytorch_ref"] = py_file.name
+        row["source"] = f"kernelbench_l{level}"
         append_result(row)
 
 
