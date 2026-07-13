@@ -68,11 +68,17 @@ def _fmt_kb(kb_results) -> str:
         return "  (no relevant KnowledgeBase entries)\n"
     lines = []
     for k in kb_results:
+        outcome = k.get("result", "?")
+        try:
+            sp = float(k.get("speedup", 0) or 0)
+        except (TypeError, ValueError):
+            sp = 0.0
+        techs = str(k.get("techniques", "")).strip() or "(unrecorded)"
+        # State the outcome and the technique IDs plainly. A failed round used to be
+        # listed under "Relevant past optimizations" with no indication it had failed.
         lines.append(
-            f"  - {k.get('strategy_used', '?')} "
-            f"→ {k.get('speedup', 0)}x "
-            f"→ insight: {k.get('insight', '?')} "
-            f"| avoid_if: {k.get('avoid_if', '?')}"
+            f"  - [{outcome}, {sp:.2f}x vs PyTorch] techniques: {techs}\n"
+            f"      insight: {k.get('insight', '?')}"
         )
     return "\n".join(lines) + "\n"
 
@@ -102,10 +108,33 @@ def _failed_strategies(history) -> list[str]:
 
 
 def _kb_avoids(kb_results) -> list[str]:
+    """
+    TECHNIQUE IDs the KB says failed — and nothing else.
+
+    This list is injected under a prompt line that says "Do NOT pick any of these",
+    so only things that ARE pickable belong in it. It used to be filled with the
+    reflector's free-text `avoid_if` sentences, which meant the planner was being
+    told not to pick a paragraph — and one of those paragraphs advised against the
+    very technique stack that had reached 98% of cuBLAS. Prose caveats are still
+    surfaced, but as advisory context (see _kb_cautions), not as hard constraints.
+    """
     out = []
     for k in (kb_results or []):
-        a = k.get("avoid_if")
-        if a and a != "unknown" and a not in out:
+        if k.get("result") == "success":
+            continue  # a technique that WORKED is not a thing to avoid
+        for t in str(k.get("techniques", "")).split(","):
+            t = t.strip()
+            if t and t in ALL_STRATEGIES and t not in out:
+                out.append(t)
+    return out
+
+
+def _kb_cautions(kb_results) -> list[str]:
+    """The reflector's prose `avoid_if` notes — advisory context, never a hard rule."""
+    out = []
+    for k in (kb_results or []):
+        a = str(k.get("avoid_if", "")).strip()
+        if a and a.lower() != "unknown" and a not in out:
             out.append(a)
     return out
 
@@ -161,14 +190,18 @@ class PlanningAgent:
             + f"  occupancy: {(metrics or {}).get('occupancy', 'n/a')}%\n"
             + f"  compute_throughput: {(metrics or {}).get('compute_throughput', 'n/a')}%\n"
             + f"  dram_throughput: {(metrics or {}).get('dram_throughput', 'n/a')}%\n\n"
-            + "KNOWLEDGEBASE EVIDENCE (strategy → speedup → insight → avoid_if):\n"
+            + "KNOWLEDGEBASE — past rounds on similar kernels. Speedups are vs PyTorch\n"
+            + "eager (cuBLAS/cuDNN), so ~1.0x means matching a hand-tuned vendor library:\n"
             + _fmt_kb(kb_results)
             + "\nTHIS SESSION'S HISTORY (technique → outcome):\n"
             + _fmt_history(history)
             + "\nCurrent best: "
             + (f"{best_speedup:.2f}x vs PyTorch eager\n" if best_speedup else "none yet\n")
-            + "\nAVOID LIST (do not pick any of these):\n"
+            + "\nAVOID LIST — techniques that FAILED before. Do not pick any of these:\n"
             + ("  " + "; ".join(base_avoid) + "\n" if base_avoid else "  (empty)\n")
+            + "\nCAUTIONS from past reflections — advisory only, NOT hard rules. Weigh them\n"
+            + "against the metrics; if the evidence says otherwise, ignore them:\n"
+            + ("".join(f"  ~ {c}\n" for c in _kb_cautions(kb_results)) or "  (none)\n")
         )
 
         try:

@@ -101,6 +101,11 @@ try:
 except Exception:
     GPU_ARCH = "sm_86"
 CONFIG_PATH  = "karma.yaml"
+# The legacy own/sglang path measures against the ORIGINAL naive kernel, not
+# PyTorch. Both paths write to the SAME KnowledgeBase, so an entry must record
+# what it was measured against -- otherwise a 2.5x legacy row outranks a 0.98x
+# torch row that is in fact the far better kernel.
+LEGACY_BASELINE = "the original unoptimized CUDA kernel (NOT PyTorch)"
 USE_KB         = True    # set False for ablation: no knowledge base
 USE_REFLECT    = True    # set False for ablation: no reflection agent
 USE_CLASSIFIER = True    # set False for ablation: no per-kernel classification
@@ -241,17 +246,25 @@ def safe_float(val, default=0.0) -> float:
 
 
 async def _reflect_and_store(*, kernel_name, bottleneck, round_num, code, result,
-                             speedup=0.0, error=""):
+                             speedup=0.0, error="", applied=None,
+                             baseline="PyTorch eager (cuBLAS/cuDNN)"):
     """Reflect on one round's outcome and persist the insight. No-op if the
-    reflector or the KB is disabled (ablation)."""
+    reflector or the KB is disabled (ablation).
+
+    `applied` and `baseline` matter: without them the reflector cannot tell what a
+    speedup of 0.99x means, and it once concluded that reaching 99% of cuBLAS was
+    "complexity that did not translate into measurable speedup".
+    """
     if not (USE_REFLECT and reflector and kb):
         return
     insight = await reflector.reflect(
         kernel_name=kernel_name, bottleneck=bottleneck, round_num=round_num,
         code=code, result=result, speedup=speedup, error=error,
+        applied=applied, baseline=baseline,
     )
     kb.store(insight)
-    print(f"    KB stored: {insight['strategy_used'][:50]}")
+    techs = insight.get("techniques") or "(none)"
+    print(f"    KB stored [{result}, {speedup:.2f}x]: {techs}")
 
 
 # ── Torch-extension loop (kernelbench) ─────────────────────────────────
@@ -381,12 +394,23 @@ async def optimize_one_torch(py_file: Path) -> dict:
     kb_ctx, kb_results = "", []
     if USE_KB and kb:
         key = classification["kernel_type"] if classification else name
-        kb_results = kb.retrieve(bottleneck=hint, kernel_name=key)
+        kb_results = kb.retrieve(
+            bottleneck=hint, kernel_name=key,
+            techniques=(classification or {}).get("preferred_strategies"),
+        )
         if kb_results:
-            kb_ctx = "Relevant past optimizations from KnowledgeBase:\n"
+            # Label the outcome. These used to be listed under "Relevant past
+            # optimizations" with no sign that some of them had failed outright.
+            kb_ctx = ("Past rounds on similar kernels (speedup is vs PyTorch eager —\n"
+                      "cuBLAS/cuDNN — so ~1.0x means matching a hand-tuned vendor library):\n")
             for p in kb_results:
-                kb_ctx += (f"  - {p.get('strategy_used','?')} → {p.get('speedup',0)}x. "
-                           f"Insight: {p.get('insight','?')}. Avoid if: {p.get('avoid_if','?')}\n")
+                try:
+                    sp = float(p.get("speedup", 0) or 0)
+                except (TypeError, ValueError):
+                    sp = 0.0
+                techs = str(p.get("techniques", "")).strip() or "(unrecorded)"
+                kb_ctx += (f"  - [{p.get('result','?')}, {sp:.2f}x] {techs}\n"
+                           f"      {p.get('insight','?')}\n")
             kb_ctx += "\n"
         print(f"  KB: {len(kb_results)} relevant entries")
     row["kb_entries_used"] = len(kb_results)
@@ -448,6 +472,10 @@ async def optimize_one_torch(py_file: Path) -> dict:
         else:
             print(f"  round {r}: asking coder...")
 
+        # Techniques this round is trying to ADD. On failure these are what the KB
+        # records as having failed; on success they become part of the stack.
+        attempted = add_techs or ([strategy] if strategy != "agent_choice" else [])
+
         out = await coder.optimize(
             best_cuda, best_cpp,
             round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
@@ -469,9 +497,11 @@ async def optimize_one_torch(py_file: Path) -> dict:
             print(f"  round {r}: COMPILE FAILED — {cerr.splitlines()[0][:60] if cerr else '?'}")
             history.append({"round": r, "result": "compile_failed", "strategy": strategy})
             err_fb = f"COMPILER ERROR:\n{cerr[:2000]}"
+            # On a failure, record the techniques that were ATTEMPTED — that is what
+            # a future planner needs in order to avoid them.
             await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
                                      code=out["cuda_source"], result="compile_failed",
-                                     error=cerr[:200])
+                                     error=cerr[:200], applied=attempted)
             continue
 
         # correctness + determinism (PyTorch is the oracle)
@@ -482,7 +512,8 @@ async def optimize_one_torch(py_file: Path) -> dict:
             history.append({"round": r, "result": kind, "strategy": strategy})
             err_fb = f"VALIDATION FAILED:\n{vmsg}"
             await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
-                                     code=out["cuda_source"], result=kind, error=vmsg[:200])
+                                     code=out["cuda_source"], result=kind, error=vmsg[:200],
+                                     applied=attempted)
             continue
 
         # benchmark
@@ -516,7 +547,8 @@ async def optimize_one_torch(py_file: Path) -> dict:
         })
 
         await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
-                                 code=out["cuda_source"], result="success", speedup=speedup)
+                                 code=out["cuda_source"], result="success", speedup=speedup,
+                                 applied=attempted or applied)
 
         # early stop: beat torch.compile by the configured margin
         if compile_ms and vs_compile >= EVAL.target_speedup_vs_compile:
@@ -780,6 +812,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             # reflect on failure
             await _reflect_and_store(
                 kernel_name=name, bottleneck=hint, round_num=r,
+                baseline=LEGACY_BASELINE,
                 code=optimized, result="compile_failed", error=err,
             )
             continue
@@ -802,6 +835,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             )
             await _reflect_and_store(
                 kernel_name=name, bottleneck=hint, round_num=r,
+                baseline=LEGACY_BASELINE,
                 code=optimized, result="dims_mismatch", error=dims_msg,
             )
             continue
@@ -822,6 +856,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             )
             await _reflect_and_store(
                 kernel_name=name, bottleneck=hint, round_num=r,
+                baseline=LEGACY_BASELINE,
                 code=optimized, result="validation_failed", error=msg,
             )
             continue
@@ -845,6 +880,7 @@ async def optimize_one(kernel_path: Path, source: str = None) -> dict:
             )
             await _reflect_and_store(
                 kernel_name=name, bottleneck=hint, round_num=r,
+                baseline=LEGACY_BASELINE,
                 code=optimized, result="unstable", error=str(det_msg)[:200],
             )
             continue
