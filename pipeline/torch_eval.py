@@ -415,3 +415,87 @@ def benchmark_interleaved(
         "speedup_vs_eager": eager_ms / karma_ms,
         "warning": "",
     }
+
+
+@torch.no_grad()
+def run_off(
+    candidates: list[dict],
+    task: Task,
+    warmup: int = 10,
+    runs: int = 30,
+    trials: int = 3,
+) -> dict:
+    """
+    Re-measure several candidate kernels BACK-TO-BACK and pick the true winner.
+
+    Why this exists: each round's speedup is measured at a different point in the
+    run, and a thermally throttling GPU drifts underneath them. Observed on this
+    box: PyTorch eager itself degraded from ~47ms to ~79ms *during* a single 4-round
+    run. Interleaving keeps a given round's eager-vs-karma comparison fair, but it
+    cannot make round 1's ratio comparable to round 4's -- a later round can "win"
+    simply because eager decayed faster than it did, and we would ship the wrong
+    kernel.
+
+    So at the end we take the surviving candidates and re-race them in one sitting,
+    round-robin across `trials` so drift is spread evenly over all of them rather
+    than accumulating on whoever went last.
+
+    candidates: [{"round": int, "mod": module, "cuda": str, "cpp": str, ...}, ...]
+    Returns the winning candidate dict, augmented with the fresh measurement.
+    """
+    if not candidates:
+        return {}
+    if len(candidates) == 1:
+        c = dict(candidates[0])
+        b = benchmark_interleaved(c["mod"], task, warmup=warmup, runs=runs)
+        c.update(karma_ms=b["karma_ms"], karma_std=b["karma_std"],
+                 eager_ms=b["eager_ms"], speedup_vs_eager=b["speedup_vs_eager"])
+        return c
+
+    inputs = task.inputs(BASELINE_SEED)
+    model = task.ref_model
+
+    for _ in range(warmup):
+        model(*inputs)
+        for c in candidates:
+            c["mod"].forward(*inputs)
+    torch.cuda.synchronize()
+
+    def _one(fn) -> float:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn(*inputs)
+        end.record()
+        torch.cuda.synchronize()
+        return start.elapsed_time(end)
+
+    samples: dict[int, list[float]] = {i: [] for i in range(len(candidates))}
+    eager: list[float] = []
+    per_trial = max(1, runs // trials)
+
+    # round-robin: eager, cand0, cand1, ... repeated. Drift hits everyone equally.
+    for _ in range(trials):
+        for _ in range(per_trial):
+            eager.append(_one(model))
+            for i, c in enumerate(candidates):
+                samples[i].append(_one(c["mod"].forward))
+
+    eager_ms = statistics.fmean(eager)
+
+    scored = []
+    for i, c in enumerate(candidates):
+        ms = statistics.fmean(samples[i])
+        sd = statistics.pstdev(samples[i]) if len(samples[i]) > 1 else 0.0
+        scored.append((eager_ms / ms if ms > 0 else 0.0, ms, sd, i))
+
+    scored.sort(reverse=True)
+    speedup, ms, sd, idx = scored[0]
+
+    winner = dict(candidates[idx])
+    winner.update(karma_ms=ms, karma_std=sd, eager_ms=eager_ms, speedup_vs_eager=speedup)
+    winner["runoff"] = [
+        {"round": candidates[i]["round"], "karma_ms": m, "speedup_vs_eager": s}
+        for s, m, _, i in scored
+    ]
+    return winner

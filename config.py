@@ -48,7 +48,11 @@ class EvalSettings(BaseModel):
     translate_retries: int = 3
     target_speedup_vs_compile: float = 1.05
     compile_timeout_s: int = 180
-    ncu_timeout_s: int = 120
+    ncu_timeout_s: int = 300
+    # How many surviving kernels get re-raced back-to-back at the end. Per-round
+    # speedups are measured minutes apart on a GPU whose clocks drift, so they are
+    # not comparable to each other; the run-off settles it in one sitting.
+    runoff_finalists: int = 3
     # Skip tasks whose peak memory exceeds this fraction of VRAM. On Windows the
     # WDDM driver silently pages past VRAM into system RAM instead of raising, so
     # an oversized task yields plausible-looking timings that only measure PCIe.

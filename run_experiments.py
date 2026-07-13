@@ -67,7 +67,7 @@ from pipeline.benchmarker import benchmark
 from pipeline.dims import dims_match
 from pipeline.torch_eval import (
     load_task, probe_task, measure_baselines, compile_extension,
-    validate as validate_ext, benchmark_interleaved, extension_name,
+    validate as validate_ext, benchmark_interleaved, run_off,
 )
 from pipeline.ext_profiler import profile_extension
 
@@ -402,6 +402,16 @@ async def optimize_one_torch(py_file: Path) -> dict:
     cc = torch.cuda.get_device_capability()
     cc_int = cc[0] * 10 + cc[1]
 
+    # Every kernel that passed validation, kept for the end-of-run run-off. Each
+    # round's speedup is measured at a different moment and this GPU throttles, so
+    # per-round ratios are NOT comparable to each other — the finalists get re-raced
+    # back-to-back before we declare a winner. Round 0 (the naive port) is a
+    # candidate too: it is the thing everything else must actually beat.
+    candidates: list[dict] = [
+        {"round": 0, "mod": mod, "cuda": cuda_src, "cpp": cpp_src,
+         "applied": [], "speedup": best_speedup}
+    ]
+
     for r in range(1, ROUNDS + 1):
         history_ctx = ""
         if history:
@@ -495,10 +505,15 @@ async def optimize_one_torch(py_file: Path) -> dict:
             for t in (add_techs or ([strategy] if strategy != "agent_choice" else [])):
                 if t not in applied:
                     applied.append(t)
-            Path("kernels/results").mkdir(parents=True, exist_ok=True)
-            Path(f"kernels/results/{name}.cu").write_text(best_cuda)
-            Path(f"kernels/results/{name}_binding.cpp").write_text(best_cpp)
             print(f"    new best — stack now: {applied or ['(unnamed)']}")
+
+        # Keep it as a finalist regardless: this round's ratio and an earlier
+        # round's are not directly comparable (see the run-off below).
+        candidates.append({
+            "round": r, "mod": mod,
+            "cuda": out["cuda_source"], "cpp": out["cpp_source"],
+            "applied": list(applied), "speedup": speedup,
+        })
 
         await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
                                  code=out["cuda_source"], result="success", speedup=speedup)
@@ -508,6 +523,40 @@ async def optimize_one_torch(py_file: Path) -> dict:
             print(f"  target met ({vs_compile:.2f}x >= {EVAL.target_speedup_vs_compile}x vs compile) — stopping")
             target_met = True
             break
+
+    # ── run-off: re-race the finalists back-to-back ────────────────────
+    # Per-round ratios were measured minutes apart on a GPU whose clocks drift, so
+    # the round with the best *recorded* ratio is not necessarily the best kernel.
+    # Re-measure them in one sitting, round-robin, and let that decide.
+    # Only serious contenders: re-racing the naive round-0 kernel 30x costs minutes
+    # (it can be an order of magnitude slower) and it cannot win. Cap by recorded
+    # speedup — that ranking is drift-contaminated, but it is more than good enough
+    # to separate contenders from no-hopers.
+    finalists = sorted(candidates, key=lambda c: -c.get("speedup", 0.0))[:EVAL.runoff_finalists]
+
+    if len(finalists) > 1:
+        print(f"  run-off: re-racing {len(finalists)} finalists back-to-back...")
+        win = run_off(finalists, task, warmup=EVAL.warmup, runs=EVAL.runs)
+        for c in win.get("runoff", []):
+            mark = "  <-- winner" if c["round"] == win["round"] else ""
+            print(f"    round {c['round']}: {c['karma_ms']:8.3f}ms  "
+                  f"{c['speedup_vs_eager']:.3f}x{mark}")
+
+        if win["round"] != best_round:
+            print(f"    NOTE: run-off overturned round {best_round} in favour of "
+                  f"round {win['round']} — the earlier ranking was thermal drift")
+
+        best_cuda, best_cpp = win["cuda"], win["cpp"]
+        best_round = win["round"]
+        best_ms, best_std = win["karma_ms"], win["karma_std"]
+        best_speedup = win["speedup_vs_eager"]
+        applied = win.get("applied", applied)
+        eager_ms = win["eager_ms"]     # freshest baseline, measured alongside the winner
+        row["eager_ms"] = eager_ms
+
+    Path("kernels/results").mkdir(parents=True, exist_ok=True)
+    Path(f"kernels/results/{name}.cu").write_text(best_cuda)
+    Path(f"kernels/results/{name}_binding.cpp").write_text(best_cpp)
 
     # ── result ─────────────────────────────────────────────────────────
     speedup_vs_compile = (compile_ms / best_ms) if (compile_ms and best_ms > 0) else 0.0
