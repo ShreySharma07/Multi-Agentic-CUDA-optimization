@@ -1,0 +1,40 @@
+# KARMA dependencies
+#
+# torch is NOT pinned here: install the build that matches your CUDA toolkit
+# first, from https://pytorch.org/get-started/locally/  e.g.
+#     pip install torch --index-url https://download.pytorch.org/whl/cu126
+# Verified on torch 2.12.1+cu126.
+
+# ── core ───────────────────────────────────────────────────────────────
+pydantic>=2.0            # config + ExperimentResult schemas
+chromadb>=1.0            # KnowledgeBase vector store
+PyYAML>=6.0              # karma.yaml
+python-dotenv>=1.0       # API keys from .env
+
+# ── optional: profiler metric cache ────────────────────────────────────
+# pre_flight caches Nsight Compute metrics here. Entirely optional — the
+# pipeline fails soft to a cache miss if Redis is not running.
+redis>=5.0
+
+# ── LLM providers ──────────────────────────────────────────────────────
+# Imported lazily, so you only need the one(s) karma.yaml actually names.
+anthropic>=0.40          # provider: anthropic
+google-genai>=1.0        # provider: gemini
+# openai>=1.0            # provider: openai
+httpx>=0.27              # provider: ollama (and used by the SDKs above)
+
+# ── torch.compile baseline ─────────────────────────────────────────────
+# torch.compile's inductor backend needs triton to emit GPU code. Triton has no
+# official Windows wheel, so without this measure_baselines() reports
+# compile_ms=None, speedup_vs_compile is always 0, and the
+# target_speedup_vs_compile early-stop can never fire. The community port
+# provides a matching wheel (cp314 verified against torch 2.12.1+cu126).
+# On Linux, plain `triton` ships with torch already — this line is a no-op there.
+triton-windows>=3.7 ; platform_system == "Windows"
+
+# ── building the generated kernels ─────────────────────────────────────
+# torch.utils.cpp_extension shells out to ninja + a host compiler. On Windows
+# Visual Studio supplies both, but only inside a VS Developer prompt; installing
+# ninja here lets the build work from an ordinary shell too (cl.exe still must be
+# on PATH). Not needed merely to USE an already-built kernel — see karma_kernels.py.
+ninja>=1.11
