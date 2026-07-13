@@ -74,10 +74,23 @@ def _fmt_kb(kb_results) -> str:
         except (TypeError, ValueError):
             sp = 0.0
         techs = str(k.get("techniques", "")).strip() or "(unrecorded)"
-        # State the outcome and the technique IDs plainly. A failed round used to be
-        # listed under "Relevant past optimizations" with no indication it had failed.
+
+        # Render the ACTUAL baseline this entry was measured against. Hardcoding
+        # "vs PyTorch" here would be a lie for legacy-path entries, whose speedups
+        # are relative to a naive kernel -- a 3.35x-vs-naive row would read as
+        # having beaten cuBLAS by 3.35x, which never happened.
+        # Test on "cuBLAS", NOT on "PyTorch": the legacy baseline string is
+        # "...(NOT PyTorch)" and a naive `"PyTorch" in base` check matches it.
+        base = str(k.get("baseline", "")).strip()
+        if "cuBLAS" in base:
+            vs = "vs PyTorch/cuBLAS"
+        elif base:
+            vs = "vs a NAIVE kernel — NOT comparable to the PyTorch/cuBLAS numbers"
+        else:
+            vs = "vs an unrecorded baseline"
+
         lines.append(
-            f"  - [{outcome}, {sp:.2f}x vs PyTorch] techniques: {techs}\n"
+            f"  - [{outcome}, {sp:.2f}x {vs}] techniques: {techs}\n"
             f"      insight: {k.get('insight', '?')}"
         )
     return "\n".join(lines) + "\n"

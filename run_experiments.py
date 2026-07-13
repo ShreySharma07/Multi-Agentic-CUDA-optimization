@@ -399,17 +399,23 @@ async def optimize_one_torch(py_file: Path) -> dict:
             techniques=(classification or {}).get("preferred_strategies"),
         )
         if kb_results:
-            # Label the outcome. These used to be listed under "Relevant past
-            # optimizations" with no sign that some of them had failed outright.
-            kb_ctx = ("Past rounds on similar kernels (speedup is vs PyTorch eager —\n"
-                      "cuBLAS/cuDNN — so ~1.0x means matching a hand-tuned vendor library):\n")
+            # Label the outcome AND the baseline. These used to be listed under
+            # "Relevant past optimizations" with no sign that some had failed
+            # outright, and with no way to tell a 3x-vs-naive row (legacy path)
+            # from a 0.98x-vs-cuBLAS row, which is the far better kernel.
+            kb_ctx = "Past rounds on similar kernels:\n"
             for p in kb_results:
                 try:
                     sp = float(p.get("speedup", 0) or 0)
                 except (TypeError, ValueError):
                     sp = 0.0
                 techs = str(p.get("techniques", "")).strip() or "(unrecorded)"
-                kb_ctx += (f"  - [{p.get('result','?')}, {sp:.2f}x] {techs}\n"
+                # Test on "cuBLAS": the legacy baseline string contains the words
+                # "NOT PyTorch", so a `"PyTorch" in base` check matches it too.
+                base = str(p.get("baseline", ""))
+                vs = ("vs PyTorch/cuBLAS" if "cuBLAS" in base
+                      else "vs a naive kernel (NOT comparable to PyTorch numbers)")
+                kb_ctx += (f"  - [{p.get('result','?')}, {sp:.2f}x {vs}] {techs}\n"
                            f"      {p.get('insight','?')}\n")
             kb_ctx += "\n"
         print(f"  KB: {len(kb_results)} relevant entries")
