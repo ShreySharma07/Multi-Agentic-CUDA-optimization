@@ -41,8 +41,23 @@ class AgentSettings(BaseModel):
         return f"{self.provider}:{self.model} (temp={self.temperature}, key={key})"
 
 
+class EvalSettings(BaseModel):
+    """Torch-extension evaluation knobs (kernelbench path)."""
+    warmup: int = 10
+    runs: int = 30
+    translate_retries: int = 3
+    target_speedup_vs_compile: float = 1.05
+    compile_timeout_s: int = 180
+    ncu_timeout_s: int = 120
+    # Skip tasks whose peak memory exceeds this fraction of VRAM. On Windows the
+    # WDDM driver silently pages past VRAM into system RAM instead of raising, so
+    # an oversized task yields plausible-looking timings that only measure PCIe.
+    vram_headroom: float = 0.80
+
+
 class KarmaConfig(BaseModel):
     agents: dict[str, AgentSettings]
+    eval: EvalSettings = EvalSettings()
 
     def for_agent(self, name: str) -> AgentSettings:
         if name not in self.agents:
@@ -88,6 +103,12 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> KarmaConfig:
 
     defaults: dict = raw.get("defaults") or {}
     agents_raw: dict = raw.get("agents") or {}
+    eval_raw: dict = raw.get("eval") or {}
+
+    try:
+        eval_settings = EvalSettings(**eval_raw)
+    except Exception as e:
+        raise ConfigError(f"invalid `eval:` section in {cfg_path}: {e}") from e
 
     unknown = set(agents_raw) - set(KNOWN_AGENTS)
     if unknown:
@@ -110,4 +131,4 @@ def load_config(path: str | Path = DEFAULT_CONFIG_PATH) -> KarmaConfig:
         merged["api_key"] = _resolve_key(provider, merged.get("api_key_env"), name)
         agents[name] = AgentSettings(**merged)
 
-    return KarmaConfig(agents=agents)
+    return KarmaConfig(agents=agents, eval=eval_settings)

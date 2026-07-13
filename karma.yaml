@@ -21,9 +21,9 @@
 #   ollama:    llama3.1, qwen2.5-coder:32b
 
 defaults:
-  provider: gemini
-  model: gemini-2.5-flash
-  api_key_env: GOOGLE_API_KEY   # must match the name used in your .env
+  provider: anthropic
+  model: claude-sonnet-5
+  api_key_env: CLAUDE_API_KEY   # must match the name used in your .env
   temperature: 0.2
   max_retries: 5
   timeout: 120
@@ -32,23 +32,38 @@ agents:
   # Writes the CUDA. The expensive, quality-critical role — give it your
   # strongest model.
   coder:
-    model: gemini-2.5-flash
+    model: claude-sonnet-5
     temperature: 0.2
 
   # One cheap call per kernel. Classification is an easy task; don't pay for it.
   classifier:
-    model: gemini-2.5-flash
+    model: claude-sonnet-5
     temperature: 0.0        # deterministic labels
 
   # One call per round. Benefits from reasoning, but the output is short.
   planner:
-    model: gemini-2.5-flash
+    model: claude-sonnet-5
     temperature: 0.3        # a little exploration across rounds
 
   # Summarises each round into a KB insight. Cheap and high-volume.
   reflector:
-    model: gemini-2.5-flash
+    model: claude-sonnet-5
     temperature: 0.0
+
+# Torch-extension evaluation (kernelbench path). Python owns inputs, the
+# PyTorch correctness oracle and the clock — see pipeline/torch_eval.py.
+eval:
+  warmup: 10
+  runs: 30
+  translate_retries: 3          # round-0 attempts at a correct naive port
+  target_speedup_vs_compile: 1.05
+  compile_timeout_s: 180        # a cold nvcc+cl build is ~50s on this box
+  ncu_timeout_s: 120
+  # Skip tasks whose peak memory exceeds this fraction of VRAM. On Windows the
+  # driver silently pages past VRAM into system RAM rather than raising, so an
+  # oversized task still "runs" while every timing measures PCIe, not the kernel.
+  # On a 6GB card this keeps 51/100 of KernelBench level1.
+  vram_headroom: 0.80
 
 # --- Mixing providers is the point. For example: ---
 #

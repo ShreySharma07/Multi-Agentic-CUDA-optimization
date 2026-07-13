@@ -1,81 +1,162 @@
 # Agents/coder.py
 """
-CoderAgent — writes the CUDA.
+CoderAgent — writes the CUDA kernel and its pybind binding, and nothing else.
 
-Owns both of its prompts (baseline generation and per-round optimization) and
-talks to whatever LLMProvider its config selects. No google-adk, no Runner, no
-shared session: the previous implementation routed all four agents through a
-single ADK session, so every agent's replies accumulated in every other agent's
-context and grew without bound over a run.
+Under the torch-extension methodology the model no longer authors a whole
+program: Python owns the inputs, the PyTorch reference and the clock. So the
+contract here is narrow on purpose — emit {"cuda_source", "cpp_source"} and
+that is all. The old prompt's instructions about main(), printing "GPU Time",
+BENCH_ONLY and preserving problem dimensions are gone, because those were only
+ever there to police cheats that are now structurally impossible.
+
+Two modes:
+  translate() — round 0. Faithful, naive, correctness-only port of the PyTorch op.
+  optimize()  — rounds 1..N. Plan-driven improvement of the current best kernel.
 """
 from __future__ import annotations
 
-from Agents.json_utils import extract_cuda_code
+from Agents.json_utils import extract_json
 from Agents.providers import LLMProvider
 
-# Constraints that apply to every kernel this agent emits. Kept as one block so
-# baseline generation and optimization can't drift apart.
-HARNESS_CONTRACT = """CORRECTNESS HARNESS (follow exactly):
-- Keep problem dimensions MODERATE so the single-threaded CPU reference finishes in
-  a few seconds and host allocations stay under ~1GB. For a reduction/matmul, keep
-  the reduction dimension <= 512 and total output <= ~4M elements.
-- Do the naive CPU reference ONCE, then compare GPU vs CPU by the RELATIVE error:
-  rel = fabs(gpu-cpu) / fmaxf(1e-6f, fabsf(cpu)). Track max_rel.
-- Because GPU and CPU accumulate reductions in different orders, use a RELATIVE
-  tolerance that scales with reduction depth K:
-      float tol = 1e-4f * sqrtf((float)K);   // K = length of the reduction, min 1
-- Print EXACTLY one line:  printf("DIFF=%e\\n", max_rel);
-- Then print SUCCESS if max_rel <= tol, else FAILURE.
-- Print EXACTLY: printf("GPU Time: %f\\n", milliseconds);   (number only, no units)
-- At the very start of main(), check: if (getenv("BENCH_ONLY") != NULL).
-  When set, SKIP the CPU reference and the DIFF/SUCCESS/FAILURE prints entirely --
-  still allocate, run the GPU kernel, and print the 'GPU Time' line as always.
+# Shared contract. Both modes emit the same JSON shape, so the two prompts can't
+# drift apart on the thing the pipeline actually parses.
+OUTPUT_CONTRACT = """OUTPUT FORMAT — return ONLY a raw JSON object, no markdown, no prose:
+{
+  "cuda_source": "<complete .cu translation unit>",
+  "cpp_source":  "<forward declaration + PYBIND11_MODULE block>"
+}
+
+cuda_source MUST:
+- #include <torch/extension.h>
+- define your __global__ kernel(s)
+- define a C++ entry point:  torch::Tensor forward(<tensor args>)
+  (use std::vector<torch::Tensor> only if the op returns several tensors)
+- forward() must take EXACTLY the tensors Model.forward takes, in the SAME order,
+  and return the same shape/dtype PyTorch returns
+- launch the kernel; call .contiguous() on inputs you index directly
+
+cpp_source MUST be:
+  torch::Tensor forward(<same signature>);
+  PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("forward", &forward); }
+
+JSON rules: the sources are JSON strings — escape newlines as \\n and quotes as \\".
+Do not wrap the JSON in code fences.
 """
 
-CORRECTNESS_RULES = """CUDA CORRECTNESS RULES — violating these produces wrong answers:
+CORRECTNESS_RULES = """CUDA CORRECTNESS RULES — violating these silently produces wrong answers:
 - Every thread in a block must reach EVERY __syncthreads(). Never `return` early
   (bounds check, triangular mask, etc.) before a barrier the rest of the block
-  will hit. Instead, let all threads run the loop and mask only the final global
-  write, where divergence is safe.
-- Never read shared memory a thread never wrote for this tile.
-"""
-
-OUTPUT_RULES = """OUTPUT RULES — no exceptions:
-- Return ONLY the raw .cu file.
-- First character must be '#' (from #include).
-- No markdown, no backticks, no explanation.
+  will hit. Let all threads run the loop and mask only the final global write,
+  where divergence is safe.
+- Never read shared memory a thread never wrote for the current tile.
+- Do not assume the input is contiguous — call .contiguous() or handle strides.
+- Match PyTorch's dtype. Do not hardcode float if the task may be another dtype.
 """
 
 
 class CoderAgent:
-    """Generates baseline kernels and per-round optimizations."""
+    """Emits {cuda_source, cpp_source}. Returns None when the model's reply
+    cannot be parsed, so the caller records the round as an empty response."""
 
     def __init__(self, provider: LLMProvider, session_id: str = "coder"):
         self.provider = provider
         self.session_id = session_id
 
-    async def _ask(self, prompt: str) -> str:
+    async def _ask_json(self, prompt: str) -> dict | None:
         raw = await self.provider.complete(prompt, session_id=self.session_id)
-        return extract_cuda_code(raw)
+        data = extract_json(raw)
+        if not data:
+            return None
 
-    # ── baseline: PyTorch reference -> standalone .cu ──────────────────
-    async def generate_baseline(self, pytorch_code: str, *, gpu_arch: str) -> str:
+        cuda = data.get("cuda_source")
+        cpp = data.get("cpp_source")
+        if not isinstance(cuda, str) or not cuda.strip():
+            return None
+        if not isinstance(cpp, str) or not cpp.strip():
+            # A missing binding is recoverable — compile_extension appends a
+            # standard PYBIND11_MODULE when one is absent.
+            cpp = ""
+        return {"cuda_source": cuda, "cpp_source": cpp}
+
+    # ── round 0: faithful translation ─────────────────────────────────
+    async def translate(self, pytorch_source: str, *, gpu_arch: str,
+                        error_feedback: str = "") -> dict | None:
+        feedback = ""
+        if error_feedback:
+            feedback = (
+                "YOUR PREVIOUS ATTEMPT FAILED. Fix this exact problem first:\n"
+                f"{error_feedback}\n\n"
+            )
+
         prompt = (
-            f"Convert this PyTorch operation to a standalone CUDA kernel for {gpu_arch}.\n\n"
-            f"PYTORCH REFERENCE:\n{pytorch_code}\n\n"
-            f"MANDATORY REQUIREMENTS:\n"
-            f"- Complete standalone .cu file with main()\n"
-            f"- Use cudaEvent_t for timing.\n"
-            f"- float32 only. No half types.\n"
-            f"- Must compile: nvcc -O2 -arch={gpu_arch} -lcublas -lcurand\n\n"
+            f"Translate this PyTorch module into a CUDA extension for {gpu_arch}.\n\n"
+            f"{feedback}"
+            f"GOAL: a FAITHFUL, NAIVE implementation. Correctness only.\n"
+            f"Do NOT optimize. Do not tile, vectorize, or fuse. A simple, obviously\n"
+            f"correct kernel is exactly what is wanted here — it is the baseline that\n"
+            f"later rounds will improve on.\n\n"
+            f"PYTORCH MODULE:\n{pytorch_source}\n\n"
             f"{CORRECTNESS_RULES}\n"
-            f"{HARNESS_CONTRACT}\n"
-            f"{OUTPUT_RULES}"
+            f"{OUTPUT_CONTRACT}"
         )
-        return await self._ask(prompt)
+        return await self._ask_json(prompt)
 
-    # ── one optimization round ────────────────────────────────────────
+    # ── rounds 1..N: plan-driven optimization ─────────────────────────
     async def optimize(
+        self,
+        cuda_source: str,
+        cpp_source: str,
+        *,
+        round_num: int,
+        rounds: int,
+        gpu_arch: str,
+        pytorch_source: str = "",
+        guidance: str = "",
+        metrics_ctx: str = "",
+        kb_ctx: str = "",
+        history_ctx: str = "",
+        best_ctx: str = "",
+        error_feedback: str = "",
+    ) -> dict | None:
+        feedback = ""
+        if error_feedback:
+            feedback = (
+                "THE PREVIOUS ROUND FAILED. Fix this before anything else:\n"
+                f"{error_feedback}\n\n"
+            )
+
+        ref = f"REFERENCE PyTorch semantics (must match exactly):\n{pytorch_source}\n\n" if pytorch_source else ""
+
+        prompt = (
+            f"You are a CUDA expert optimizing a kernel for {gpu_arch}.\n"
+            f"Round {round_num} of {rounds}.\n\n"
+            f"{feedback}"
+            f"{guidance}"
+            f"{metrics_ctx}"
+            f"{kb_ctx}"
+            f"{history_ctx}"
+            f"{best_ctx}"
+            f"{ref}"
+            f"HARD CONSTRAINTS:\n"
+            f"- Apply ONE focused optimization this round.\n"
+            f"- The kernel must remain numerically correct: it is checked against\n"
+            f"  PyTorch on three random seeds and for run-to-run determinism.\n"
+            f"- You may call at:: ops or cuBLAS via\n"
+            f"  at::cuda::getCurrentCUDABlasHandle() for sub-steps, but the core\n"
+            f"  improvement must be your own kernel unless the plan says otherwise.\n"
+            f"- Keep forward()'s signature and return type unchanged.\n\n"
+            f"{CORRECTNESS_RULES}\n"
+            f"{OUTPUT_CONTRACT}\n"
+            f"CURRENT KERNEL (cuda_source):\n{cuda_source}\n\n"
+            f"CURRENT BINDING (cpp_source):\n{cpp_source}\n"
+        )
+        return await self._ask_json(prompt)
+
+    # ── legacy: standalone .cu (own/ and sglang/ modes) ───────────────
+    # These modes still evaluate a self-contained program with its own main(),
+    # CPU reference and timing. They are untouched by the torch-extension
+    # migration, which applies to the kernelbench path only.
+    async def optimize_standalone(
         self,
         kernel_source: str,
         *,
@@ -88,52 +169,46 @@ class CoderAgent:
         history_ctx: str = "",
         best_ctx: str = "",
     ) -> str:
+        from Agents.json_utils import extract_cuda_code
+
         prompt = (
             f"You are a CUDA expert optimizing for {gpu_arch}.\n"
             f"Round {round_num} of {rounds}.\n\n"
-            f"{guidance}"
-            f"{metrics_ctx}"
-            f"{kb_ctx}"
-            f"{history_ctx}"
-            f"{best_ctx}"
+            f"{guidance}{metrics_ctx}{kb_ctx}{history_ctx}{best_ctx}"
             f"HARD CONSTRAINTS:\n"
             f"- float32 only. No half / half2 / __half / fp16.\n"
-            f"- No cuda/cmath, no std::complex headers.\n"
             f"- Apply ONE focused optimization per round.\n"
-            f"- If previous round had a compile error, fix THAT error first.\n"
             f"- PRESERVE THE HARNESS: keep main(), the CPU reference, the 'GPU Time'\n"
             f"  print, the 'DIFF=%e' print and the SUCCESS/FAILURE logic EXACTLY as\n"
-            f"  given. Optimize only the device kernel(s) and their launch config —\n"
-            f"  never delete or weaken the verification, and never change the\n"
-            f"  tolerance to force a pass.\n"
-            f"- Do NOT change any PROBLEM-SIZE constant (N, N_TEST, matrix dims, batch,\n"
-            f"  channels). This is checked automatically and such a round is rejected.\n"
-            f"  Tuning knobs (TILE_SIZE, BLOCK_DIM, THREADS_PER_BLOCK, UNROLL_FACTOR)\n"
-            f"  ARE free to change — that is the point.\n"
+            f"  given. Never weaken the verification or change the tolerance.\n"
+            f"- Do NOT change any PROBLEM-SIZE constant (N, N_TEST, batch, channels);\n"
+            f"  this is checked automatically. Tuning knobs (TILE_SIZE, BLOCK_DIM,\n"
+            f"  UNROLL_FACTOR) ARE free to change.\n"
             f"- Keep the BENCH_ONLY environment-variable check intact if present.\n\n"
             f"{CORRECTNESS_RULES}\n"
-            f"{OUTPUT_RULES}"
+            f"OUTPUT RULES:\n"
+            f"- Return ONLY the raw .cu file. First character must be '#'.\n"
+            f"- No markdown, no backticks, no explanation.\n"
             f"- Must compile: nvcc -O2 -arch={gpu_arch} -lcublas -lcurand\n\n"
             f"KERNEL TO OPTIMIZE:\n{kernel_source}"
         )
-        return await self._ask(prompt)
+        raw = await self.provider.complete(prompt, session_id=self.session_id)
+        return extract_cuda_code(raw)
 
 
 # ── Backwards-compatibility shim ───────────────────────────────────────
-# server.py and main.py still call the old ADK-era entry point:
+# server.py and main.py still call the ADK-era entry point:
 #     safe_chat(prompt, runner, USER_ID, SESSION_ID) -> raw text
-# The ADK arguments are now meaningless (there is no Runner and no shared
-# session), but keeping the signature lets those callers work unchanged.
-# Prefer CoderAgent directly in new code.
+# The ADK arguments are inert (no Runner, no shared session). Prefer CoderAgent
+# directly in new code.
 USER_ID = "user_1"
 SESSION_ID = "session_001"
-runner = None  # ADK Runner is gone; kept so `from Agents.coder import runner` works
+runner = None
 
 _default_coder: CoderAgent | None = None
 
 
 def _get_default_coder() -> CoderAgent:
-    """Build the coder from karma.yaml on first use (not at import time)."""
     global _default_coder
     if _default_coder is None:
         from config import load_config
