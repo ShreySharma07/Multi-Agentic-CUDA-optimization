@@ -22,26 +22,32 @@ from Agents.providers import LLMProvider
 # ── Strategy taxonomy ──────────────────────────────────────────────────
 # Per kernel_type, the strategies we PREFER to try. "other" is deliberately
 # empty so the planner is unconstrained for kernels we can't confidently type.
-STRATEGY_TAXONOMY = {
-    "elementwise":  ["vectorized_loads_float4", "fast_math_intrinsics",
-                     "grid_stride_loop", "occupancy_tuning"],
-    "reduction":    ["warp_shuffle_reduction", "shared_memory_tree_reduction",
-                     "vectorized_loads_float4", "multi_element_per_thread"],
-    "matmul":       ["shared_memory_tiling", "register_blocking",
-                     "vectorized_loads_float4", "loop_unrolling"],
-    "attention":    ["online_softmax", "shared_memory_tiling",
-                     "warp_shuffle_reduction"],
-    "convolution":  ["shared_memory_tiling", "constant_memory_filters",
-                     "loop_unrolling"],
-    "other":        [],  # planner gets full freedom
-}
+#
+# Sourced from Agents/playbook.py so the classifier, the planner and the
+# playbook all speak ONE vocabulary. The earlier hand-written list was missing
+# the techniques that actually close the gap to a hand-tuned kernel (double
+# buffering, async copy, bank-conflict avoidance, warp tiling), and the planner
+# cannot prefer a name it has never heard of.
+#
+# Still a SOFT PRIOR: the planner may go outside it entirely (strategy="other").
+from Agents.playbook import CANONICAL_STACKS
+
+STRATEGY_TAXONOMY = {k: list(v) for k, v in CANONICAL_STACKS.items()}
 
 VALID_TYPES = list(STRATEGY_TAXONOMY.keys())
 VALID_BOTTLENECKS = ("memory-bound", "compute-bound", "unknown")
 VALID_CONFIDENCE = ("high", "medium", "low")
 
-# Flat vocabulary of every known strategy name (used to reject hallucinations).
-ALL_STRATEGIES = sorted({s for v in STRATEGY_TAXONOMY.values() for s in v})
+# Flat vocabulary of every known strategy name. This is the FULL playbook, not
+# just the canonical stacks — a technique the playbook documents (e.g.
+# read_only_cache, minimize_divergence) is a legitimate named strategy even when
+# it isn't in a kernel type's default stack, and shouldn't be misfiled as
+# off-taxonomy "other".
+from Agents.playbook import technique_names
+
+ALL_STRATEGIES = sorted(
+    set(technique_names()) | {s for v in STRATEGY_TAXONOMY.values() for s in v}
+)
 
 CLASSIFIER_LOG_CSV = "results/classifier_log.csv"
 CLASSIFIER_LOG_FIELDS = [

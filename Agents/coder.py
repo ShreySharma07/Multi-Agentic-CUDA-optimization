@@ -117,6 +117,7 @@ class CoderAgent:
         history_ctx: str = "",
         best_ctx: str = "",
         error_feedback: str = "",
+        applied: list[str] | None = None,
     ) -> dict | None:
         feedback = ""
         if error_feedback:
@@ -127,24 +128,49 @@ class CoderAgent:
 
         ref = f"REFERENCE PyTorch semantics (must match exactly):\n{pytorch_source}\n\n" if pytorch_source else ""
 
+        applied_ctx = ""
+        if applied:
+            applied_ctx = (
+                "OPTIMIZATIONS ALREADY IN THIS KERNEL — every one of these must SURVIVE "
+                "your edit:\n  " + ", ".join(applied) + "\n\n"
+            )
+
         prompt = (
             f"You are a CUDA expert optimizing a kernel for {gpu_arch}.\n"
             f"Round {round_num} of {rounds}.\n\n"
             f"{feedback}"
+            f"{applied_ctx}"
             f"{guidance}"
             f"{metrics_ctx}"
             f"{kb_ctx}"
             f"{history_ctx}"
             f"{best_ctx}"
             f"{ref}"
+            f"THIS CHANGE IS CUMULATIVE — read this twice:\n"
+            f"- A fast kernel is a STACK of techniques applied TOGETHER, each covering a\n"
+            f"  different bottleneck. Shared-memory tiling AND register blocking AND wide\n"
+            f"  loads AND a conflict-free layout — all at once, not one instead of another.\n"
+            f"- KEEP every optimization already present and ADD the new one(s) on top.\n"
+            f"- Do NOT rewrite the kernel from scratch. Do NOT drop an existing technique to\n"
+            f"  make room for a new one. Replacing a working technique with a different one\n"
+            f"  typically loses everything the first one bought.\n"
+            f"- If a new technique genuinely subsumes an existing one, say so in a comment\n"
+            f"  and make sure the result is strictly better, not merely different.\n"
+            f"- You may apply MULTIPLE techniques in one round when they belong together.\n\n"
             f"HARD CONSTRAINTS:\n"
-            f"- Apply ONE focused optimization this round.\n"
-            f"- The kernel must remain numerically correct: it is checked against\n"
-            f"  PyTorch on three random seeds and for run-to-run determinism.\n"
-            f"- You may call at:: ops or cuBLAS via\n"
-            f"  at::cuda::getCurrentCUDABlasHandle() for sub-steps, but the core\n"
-            f"  improvement must be your own kernel unless the plan says otherwise.\n"
-            f"- Keep forward()'s signature and return type unchanged.\n\n"
+            f"- The kernel must remain numerically correct: it is checked against PyTorch\n"
+            f"  on three random seeds AND for run-to-run determinism (a race is caught here).\n"
+            f"- Keep forward()'s signature and return type unchanged.\n"
+            f"- You may call at:: ops or cuBLAS via at::cuda::getCurrentCUDABlasHandle() for\n"
+            f"  sub-steps, but the core improvement must be your own kernel unless the plan\n"
+            f"  says otherwise.\n"
+            f"- Tile sizes, unroll factors, block dims and vector widths are yours to choose\n"
+            f"  and tune for {gpu_arch} — they are not fixed by anyone.\n\n"
+            f"REASON FIRST, THEN WRITE:\n"
+            f"The plan and the playbook are a prior, not a cage. If the metrics or the code\n"
+            f"itself tell you something the plan missed — a different technique, an extra one,\n"
+            f"or a restructuring of the algorithm — do that instead, and leave a brief comment\n"
+            f"in the kernel saying why. Measured speedup against PyTorch is what counts.\n\n"
             f"{CORRECTNESS_RULES}\n"
             f"{OUTPUT_CONTRACT}\n"
             f"CURRENT KERNEL (cuda_source):\n{cuda_source}\n\n"

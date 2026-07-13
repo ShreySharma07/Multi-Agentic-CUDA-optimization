@@ -55,6 +55,8 @@ import importlib.util
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+
+import torch
 from pydantic import BaseModel
 
 # pipeline
@@ -162,6 +164,7 @@ class ExperimentResult(BaseModel):
     kernel_type:              str = ""   # ClassifierAgent label
     classifier_confidence:    str = ""   # high | medium | low
     strategies_tried:         str = ""   # semicolon-joined per-round strategy names
+    applied_techniques:       str = ""   # cumulative stack in the BEST kernel
     planner_used_other_count: int = 0    # rounds where the planner went off-taxonomy
     pytorch_ref:          Optional[str] = None
 
@@ -389,8 +392,15 @@ async def optimize_one_torch(py_file: Path) -> dict:
     row["kb_entries_used"] = len(kb_results)
 
     # ── optimization rounds ────────────────────────────────────────────
+    # `applied` is the cumulative stack of techniques currently in the BEST kernel.
+    # It is what makes rounds additive: the planner is told what must be preserved,
+    # the coder is told to keep it and layer on top. Without this the agent swaps
+    # techniques and each round undoes the last.
     history, planner_other, target_met = [], 0, False
+    applied: list[str] = []
     err_fb = ""
+    cc = torch.cuda.get_device_capability()
+    cc_int = cc[0] * 10 + cc[1]
 
     for r in range(1, ROUNDS + 1):
         history_ctx = ""
@@ -403,18 +413,28 @@ async def optimize_one_torch(py_file: Path) -> dict:
                     history_ctx += f"  Round {h['round']}: {h['strategy']} → FAILED ({h['result']})\n"
             history_ctx += "\n"
 
-        best_ctx = f"Current best: {best_speedup:.2f}x vs eager — beat it.\n\n"
+        best_ctx = f"Current best: {best_speedup:.2f}x vs PyTorch eager — beat it.\n\n"
 
         strategy = "agent_choice"
+        add_techs: list[str] = []
         guidance = ""
         if USE_PLANNER and planner:
-            plan = await planner.plan(classification, metrics, kb_results, history, best_speedup)
+            plan = await planner.plan(
+                classification, metrics, kb_results, history, best_speedup,
+                applied=applied, cc=cc_int,
+            )
             strategy = plan.get("strategy", "agent_choice")
+            add_techs = plan.get("add_techniques", []) or []
             if plan.get("strategy_is_other"):
                 planner_other += 1
-            guidance = ("Implement EXACTLY this plan. Do not choose a different strategy:\n"
-                        + json.dumps(plan, indent=2) + "\n\n")
-            print(f"  round {r}: plan → {strategy}")
+            guidance = (
+                "PLAN FOR THIS ROUND — implement it, and reason beyond it if the code or the\n"
+                "metrics tell you something it missed:\n"
+                + json.dumps(plan, indent=2) + "\n\n"
+            )
+            keep = plan.get("keep_techniques", [])
+            print(f"  round {r}: plan → add {add_techs or [strategy]}"
+                  + (f" | keep {keep}" if keep else ""))
         else:
             print(f"  round {r}: asking coder...")
 
@@ -423,7 +443,7 @@ async def optimize_one_torch(py_file: Path) -> dict:
             round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
             pytorch_source=task.source, guidance=guidance, metrics_ctx=metrics_ctx,
             kb_ctx=kb_ctx, history_ctx=history_ctx, best_ctx=best_ctx,
-            error_feedback=err_fb,
+            error_feedback=err_fb, applied=applied,
         )
         if not out:
             print(f"  round {r}: unparseable reply")
@@ -470,10 +490,15 @@ async def optimize_one_torch(py_file: Path) -> dict:
         if speedup > best_speedup:
             best_cuda, best_cpp = out["cuda_source"], out["cpp_source"]
             best_speedup, best_ms, best_std, best_round = speedup, b["karma_ms"], b["karma_std"], r
+            # The stack grew: these techniques are now IN the best kernel, and every
+            # later round must preserve them.
+            for t in (add_techs or ([strategy] if strategy != "agent_choice" else [])):
+                if t not in applied:
+                    applied.append(t)
             Path("kernels/results").mkdir(parents=True, exist_ok=True)
             Path(f"kernels/results/{name}.cu").write_text(best_cuda)
             Path(f"kernels/results/{name}_binding.cpp").write_text(best_cpp)
-            print(f"    new best — saved kernels/results/{name}.cu")
+            print(f"    new best — stack now: {applied or ['(unnamed)']}")
 
         await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
                                  code=out["cuda_source"], result="success", speedup=speedup)
@@ -497,13 +522,14 @@ async def optimize_one_torch(py_file: Path) -> dict:
         validation_failures=sum(1 for h in history if h["result"] == "validation_failed"),
         unstable_rounds=sum(1 for h in history if h["result"] == "unstable"),
         strategies_tried=";".join(h["strategy"] for h in history),
+        applied_techniques=";".join(applied),
         planner_used_other_count=planner_other,
         status="ok",
     )
 
     print(f"\n  RESULT: {best_speedup:.2f}x vs eager"
           + (f" | {speedup_vs_compile:.2f}x vs compile" if speedup_vs_compile else "")
-          + f" | round={best_round} | target_met={target_met}")
+          + f" | round={best_round} | stack={applied or ['(none)']}")
     return ExperimentResult(**row).model_dump()
 
 
