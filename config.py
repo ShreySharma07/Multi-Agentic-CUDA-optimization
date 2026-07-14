@@ -47,7 +47,7 @@ class EvalSettings(BaseModel):
     runs: int = 30
     translate_retries: int = 3
     target_speedup_vs_compile: float = 1.05
-    compile_timeout_s: int = 180
+    compile_timeout_s: int = 600
     ncu_timeout_s: int = 300
     # How many surviving kernels get re-raced back-to-back at the end. Per-round
     # speedups are measured minutes apart on a GPU whose clocks drift, so they are

@@ -411,9 +411,12 @@ async def optimize_one_torch(py_file: Path) -> dict:
                     sp = 0.0
                 techs = str(p.get("techniques", "")).strip() or "(unrecorded)"
                 # Test on "cuBLAS": the legacy baseline string contains the words
-                # "NOT PyTorch", so a `"PyTorch" in base` check matches it too.
-                base = str(p.get("baseline", ""))
-                vs = ("vs PyTorch/cuBLAS" if "cuBLAS" in base
+                # "NOT PyTorch", so a `"PyTorch" in ..." check matches it too.
+                # NB: named entry_baseline, not `base` — `base` is the
+                # measure_baselines() dict in this scope and shadowing it broke
+                # the run-off.
+                entry_baseline = str(p.get("baseline", ""))
+                vs = ("vs PyTorch/cuBLAS" if "cuBLAS" in entry_baseline
                       else "vs a naive kernel (NOT comparable to PyTorch numbers)")
                 kb_ctx += (f"  - [{p.get('result','?')}, {sp:.2f}x {vs}] {techs}\n"
                            f"      {p.get('insight','?')}\n")
@@ -426,6 +429,8 @@ async def optimize_one_torch(py_file: Path) -> dict:
     # It is what makes rounds additive: the planner is told what must be preserved,
     # the coder is told to keep it and layer on top. Without this the agent swaps
     # techniques and each round undoes the last.
+    # target_met is NOT decided in the loop — it is settled after the run-off, on a
+    # torch.compile timing taken in the same sitting as the winning kernel.
     history, planner_other, target_met = [], 0, False
     applied: list[str] = []
     err_fb = ""
@@ -534,14 +539,21 @@ async def optimize_one_torch(py_file: Path) -> dict:
               + (f", {vs_compile:.2f}x vs compile" if vs_compile else ""))
         history.append({"round": r, "result": "success", "strategy": strategy, "speedup": speedup})
 
+        # The stack THIS kernel carries: whatever the running best had, plus what
+        # this round added. Computed unconditionally, because the per-round ratio
+        # is drift-contaminated and the run-off below may well overturn it. Deriving
+        # it only inside `if speedup > best_speedup` lost the technique record for
+        # any round that lost the drifty comparison but won the run-off — which is
+        # exactly the case the run-off exists to catch.
+        round_stack = list(applied)
+        for t in attempted:
+            if t not in round_stack:
+                round_stack.append(t)
+
         if speedup > best_speedup:
             best_cuda, best_cpp = out["cuda_source"], out["cpp_source"]
             best_speedup, best_ms, best_std, best_round = speedup, b["karma_ms"], b["karma_std"], r
-            # The stack grew: these techniques are now IN the best kernel, and every
-            # later round must preserve them.
-            for t in (add_techs or ([strategy] if strategy != "agent_choice" else [])):
-                if t not in applied:
-                    applied.append(t)
+            applied = list(round_stack)   # later rounds must preserve these
             print(f"    new best — stack now: {applied or ['(unnamed)']}")
 
         # Keep it as a finalist regardless: this round's ratio and an earlier
@@ -549,17 +561,21 @@ async def optimize_one_torch(py_file: Path) -> dict:
         candidates.append({
             "round": r, "mod": mod,
             "cuda": out["cuda_source"], "cpp": out["cpp_source"],
-            "applied": list(applied), "speedup": speedup,
+            "applied": round_stack, "speedup": speedup,
         })
 
         await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
                                  code=out["cuda_source"], result="success", speedup=speedup,
-                                 applied=attempted or applied)
+                                 applied=attempted or round_stack)
 
-        # early stop: beat torch.compile by the configured margin
+        # Early stop on beating torch.compile — but NOT on `vs_compile`, which is
+        # drift-contaminated: compile_ms was measured once at the start and this
+        # kernel is timed minutes later. Deciding on it once inflated 1.07x to
+        # 1.38x. The honest number only exists after the run-off, so the target is
+        # evaluated there.
         if compile_ms and vs_compile >= EVAL.target_speedup_vs_compile:
-            print(f"  target met ({vs_compile:.2f}x >= {EVAL.target_speedup_vs_compile}x vs compile) — stopping")
-            target_met = True
+            print(f"  provisionally beating torch.compile ({vs_compile:.2f}x, drift-prone) "
+                  f"— stopping; the run-off will confirm")
             break
 
     # ── run-off: re-race the finalists back-to-back ────────────────────
@@ -572,13 +588,23 @@ async def optimize_one_torch(py_file: Path) -> dict:
     # to separate contenders from no-hopers.
     finalists = sorted(candidates, key=lambda c: -c.get("speedup", 0.0))[:EVAL.runoff_finalists]
 
-    if len(finalists) > 1:
-        print(f"  run-off: re-racing {len(finalists)} finalists back-to-back...")
-        win = run_off(finalists, task, warmup=EVAL.warmup, runs=EVAL.runs)
+    # torch.compile races AS AN ARM, not as a number remembered from the start of
+    # the run. compile_ms was captured in measure_baselines() minutes ago; dividing
+    # it by a freshly-timed kernel once turned a true 1.07x into a reported 1.38x.
+    refs = {"compile": base["compiled"]} if base.get("compiled") is not None else {}
+    speedup_vs_compile = 0.0
+
+    if finalists:
+        print(f"  run-off: re-racing {len(finalists)} finalist(s)"
+              + (" + torch.compile" if refs else "") + " back-to-back...")
+        win = run_off(finalists, task, warmup=EVAL.warmup, runs=EVAL.runs, refs=refs)
+
         for c in win.get("runoff", []):
             mark = "  <-- winner" if c["round"] == win["round"] else ""
-            print(f"    round {c['round']}: {c['karma_ms']:8.3f}ms  "
-                  f"{c['speedup_vs_eager']:.3f}x{mark}")
+            print(f"    round {c['round']:>2}: {c['karma_ms']:8.3f}ms  "
+                  f"{c['speedup_vs_eager']:.3f}x vs eager{mark}")
+        for k, ms in win.get("ref_ms", {}).items():
+            print(f"    {k:>8}: {ms:8.3f}ms")
 
         if win["round"] != best_round:
             print(f"    NOTE: run-off overturned round {best_round} in favour of "
@@ -589,15 +615,28 @@ async def optimize_one_torch(py_file: Path) -> dict:
         best_ms, best_std = win["karma_ms"], win["karma_std"]
         best_speedup = win["speedup_vs_eager"]
         applied = win.get("applied", applied)
-        eager_ms = win["eager_ms"]     # freshest baseline, measured alongside the winner
+        eager_ms = win["eager_ms"]           # freshest baseline, same sitting as the winner
         row["eager_ms"] = eager_ms
+
+        # Both measured in the same sitting -> directly comparable.
+        speedup_vs_compile = win.get("speedup_vs_ref", {}).get("compile", 0.0)
+        if refs:
+            row["compile_ms"] = win["ref_ms"]["compile"]
+            compile_ms = win["ref_ms"]["compile"]
+
+    # target_met is decided HERE, on the drift-free number, not on the provisional
+    # per-round one that stopped the loop.
+    target_met = bool(compile_ms and speedup_vs_compile >= EVAL.target_speedup_vs_compile)
+    if compile_ms:
+        verdict = "MET" if target_met else "not met"
+        print(f"  vs torch.compile: {speedup_vs_compile:.3f}x "
+              f"(target {EVAL.target_speedup_vs_compile}x — {verdict})")
 
     Path("kernels/results").mkdir(parents=True, exist_ok=True)
     Path(f"kernels/results/{name}.cu").write_text(best_cuda)
     Path(f"kernels/results/{name}_binding.cpp").write_text(best_cpp)
 
     # ── result ─────────────────────────────────────────────────────────
-    speedup_vs_compile = (compile_ms / best_ms) if (compile_ms and best_ms > 0) else 0.0
     row.update(
         best_ms=best_ms, best_ms_std=best_std, best_round=best_round,
         karma_ms=best_ms, karma_std=best_std,

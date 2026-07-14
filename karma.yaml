@@ -57,7 +57,9 @@ eval:
   runs: 30
   translate_retries: 3          # round-0 attempts at a correct naive port
   target_speedup_vs_compile: 1.05
-  compile_timeout_s: 180        # a cold nvcc+cl build is ~50s on this box
+  compile_timeout_s: 600        # a cold nvcc+cl build is ~50s idle, but well over
+                                # 180s when the machine is loaded — and a timeout
+                                # throws away a build that usually succeeded
   ncu_timeout_s: 300            # ncu is once per task; it timed out at 120s under load
   # Per-round speedups are measured minutes apart and this GPU throttles (eager
   # itself drifted 47ms -> 79ms during one run), so a later round can "win" merely

@@ -199,14 +199,16 @@ def measure_baselines(task: Task, warmup: int = 10, runs: int = 30) -> dict:
     eager_ms, eager_std = _time_callable(model, inputs, warmup, runs)
 
     compile_ms = compile_std = None
+    compiled = None
     compile_note = ""
     if not torch_compile_available():
-        compile_note = "triton not installed (no Windows wheel) — torch.compile baseline unavailable"
+        compile_note = "triton not installed — torch.compile baseline unavailable"
     else:
         try:
             compiled = torch.compile(model)
             compile_ms, compile_std = _time_callable(compiled, inputs, warmup, runs)
         except Exception as e:
+            compiled = None
             compile_note = f"torch.compile failed: {e.__class__.__name__}"
 
     if compile_note:
@@ -227,6 +229,11 @@ def measure_baselines(task: Task, warmup: int = 10, runs: int = 30) -> dict:
         "compile_ms": compile_ms,
         "compile_std": compile_std,
         "compile_note": compile_note,
+        # The compiled callable itself, so the end-of-run run-off can race it in
+        # the same sitting as the kernel. compile_ms alone is measured here, at the
+        # START, and comparing it to a kernel timed minutes later is exactly the
+        # thermal-drift error the run-off exists to eliminate.
+        "compiled": compiled,
         "peak_gb": peak_gb,
         "spilled": spilled,
         "expected": expected,
@@ -282,13 +289,28 @@ def compile_extension(
             verbose=False,
         )
 
+    # NOTE on the timeout: `with ThreadPoolExecutor(...)` calls shutdown(wait=True)
+    # on exit, so a TimeoutError raised inside the block would still BLOCK until the
+    # build finished -- the timeout enforced nothing, it just waited the full build
+    # and then discarded a compile that had actually succeeded. (Observed: three
+    # "timed out after 180s" translate attempts, 12 minutes of wall clock, all of
+    # them builds that in fact completed.) Python cannot kill a running thread, so
+    # instead we shut the pool down WITHOUT waiting and let the orphan finish in the
+    # background -- it only populates torch's on-disk cache, which makes the next
+    # attempt at the same source instant.
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(_build).result(timeout=timeout_s), ""
+        fut = pool.submit(_build)
+        return fut.result(timeout=timeout_s), ""
     except FuturesTimeout:
-        return None, f"Compilation timed out after {timeout_s}s (hung compiler)."
+        return None, (
+            f"Compilation exceeded {timeout_s}s. The build may still be running in "
+            f"the background; retrying the same source will likely hit torch's cache."
+        )
     except Exception as e:
         return None, f"{e.__class__.__name__}: {e}"
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ── Correctness ────────────────────────────────────────────────────────
@@ -424,6 +446,7 @@ def run_off(
     warmup: int = 10,
     runs: int = 30,
     trials: int = 3,
+    refs: dict | None = None,
 ) -> dict:
     """
     Re-measure several candidate kernels BACK-TO-BACK and pick the true winner.
@@ -440,25 +463,33 @@ def run_off(
     round-robin across `trials` so drift is spread evenly over all of them rather
     than accumulating on whoever went last.
 
+    `refs` are extra reference arms raced alongside the candidates -- pass
+    {"compile": compiled_model} so speedup_vs_compile is measured in the SAME
+    sitting as the kernel. Without that it suffers precisely the bug this function
+    exists to fix: compile_ms was measured once in measure_baselines() at the start
+    and the kernel minutes later, which inflated a true 1.07x to a reported 1.38x.
+
     candidates: [{"round": int, "mod": module, "cuda": str, "cpp": str, ...}, ...]
-    Returns the winning candidate dict, augmented with the fresh measurement.
+    Returns the winning candidate dict, augmented with the fresh measurement and a
+    `ref_ms` map of the reference arms.
     """
     if not candidates:
         return {}
-    if len(candidates) == 1:
-        c = dict(candidates[0])
-        b = benchmark_interleaved(c["mod"], task, warmup=warmup, runs=runs)
-        c.update(karma_ms=b["karma_ms"], karma_std=b["karma_std"],
-                 eager_ms=b["eager_ms"], speedup_vs_eager=b["speedup_vs_eager"])
-        return c
 
+    refs = refs or {}
     inputs = task.inputs(BASELINE_SEED)
     model = task.ref_model
 
+    # Every arm is a zero-arg callable timed identically.
+    arms: list[tuple[str, object]] = [("eager", model)]
+    for rname, rfn in refs.items():
+        arms.append((rname, rfn))
+    for i, c in enumerate(candidates):
+        arms.append((f"cand{i}", c["mod"].forward))
+
     for _ in range(warmup):
-        model(*inputs)
-        for c in candidates:
-            c["mod"].forward(*inputs)
+        for _, fn in arms:
+            fn(*inputs)
     torch.cuda.synchronize()
 
     def _one(fn) -> float:
@@ -470,23 +501,24 @@ def run_off(
         torch.cuda.synchronize()
         return start.elapsed_time(end)
 
-    samples: dict[int, list[float]] = {i: [] for i in range(len(candidates))}
-    eager: list[float] = []
+    samples: dict[str, list[float]] = {k: [] for k, _ in arms}
     per_trial = max(1, runs // trials)
 
-    # round-robin: eager, cand0, cand1, ... repeated. Drift hits everyone equally.
+    # round-robin over EVERY arm (eager, refs, candidates) so drift is spread
+    # evenly rather than accumulating on whoever runs last.
     for _ in range(trials):
         for _ in range(per_trial):
-            eager.append(_one(model))
-            for i, c in enumerate(candidates):
-                samples[i].append(_one(c["mod"].forward))
+            for k, fn in arms:
+                samples[k].append(_one(fn))
 
-    eager_ms = statistics.fmean(eager)
+    eager_ms = statistics.fmean(samples["eager"])
+    ref_ms = {k: statistics.fmean(samples[k]) for k in refs}
 
     scored = []
     for i, c in enumerate(candidates):
-        ms = statistics.fmean(samples[i])
-        sd = statistics.pstdev(samples[i]) if len(samples[i]) > 1 else 0.0
+        s = samples[f"cand{i}"]
+        ms = statistics.fmean(s)
+        sd = statistics.pstdev(s) if len(s) > 1 else 0.0
         scored.append((eager_ms / ms if ms > 0 else 0.0, ms, sd, i))
 
     scored.sort(reverse=True)
@@ -494,6 +526,12 @@ def run_off(
 
     winner = dict(candidates[idx])
     winner.update(karma_ms=ms, karma_std=sd, eager_ms=eager_ms, speedup_vs_eager=speedup)
+    winner["ref_ms"] = ref_ms
+    # Reference speedups measured in the SAME sitting as the winner, so they are
+    # directly comparable -- unlike a compile_ms captured minutes earlier.
+    winner["speedup_vs_ref"] = {
+        k: (v / ms if ms > 0 else 0.0) for k, v in ref_ms.items()
+    }
     winner["runoff"] = [
         {"round": candidates[i]["round"], "karma_ms": m, "speedup_vs_eager": s}
         for s, m, _, i in scored
