@@ -123,6 +123,27 @@ PLAYBOOK: dict[str, dict] = {
         "pitfall": "Too much coarsening cuts parallelism and occupancy — sweep the factor.",
     },
 
+    # ---- op-chain fusion (Level 2/3: a heavy op wrapped in cheap ops) -----
+    "vendor_op_fused_epilogue": {
+        "what": "For a CHAIN of ops dominated by one heavy op (gemm/conv), call the VENDOR "
+                "library for that op -- at::linear / at::matmul / at::conv2d, or cuBLAS via "
+                "at::cuda::getCurrentCUDABlasHandle() -- and fuse EVERY surrounding "
+                "elementwise/reduction op (scale, bias, add, clamp, activation, logsumexp, "
+                "norm, ...) into ONE custom CUDA kernel. Do NOT reimplement the heavy op.",
+        "when": "A fused op-chain whose runtime is dominated by a gemm or conv -- i.e. most of "
+                "KernelBench Level 2 and Level 3. This is essentially the ONLY way to win here.",
+        "bottleneck": "any", "min_cc": None,
+        "stacks_with": ["vectorized_loads", "fast_math_intrinsics", "warp_shuffle_reduction",
+                        "shared_memory_tree_reduction"],
+        "requires": [],
+        "pitfall": "Your own gemm/conv CANNOT beat cuBLAS/cuDNN -- writing one (shared_memory_tiling "
+                   "+ register_blocking on the heavy op) is the classic mistake here and loses badly. "
+                   "The entire win is fusing the cheap epilogue so it costs no extra kernel launches "
+                   "or DRAM round-trips. Pointless for a PURE heavy op with no surrounding ops (you'd "
+                   "just match the vendor lib). Feed the vendor op's output straight into your fused "
+                   "kernel without materialising an intermediate.",
+    },
+
     # ---- compute / ILP ---------------------------------------------------
     "register_blocking": {
         "what": "Each thread computes a small micro-tile of the output with accumulators held in "
@@ -282,6 +303,11 @@ PLAYBOOK: dict[str, dict] = {
 # ordering, not a script: the planner may reorder, skip, or go outside it.
 CANONICAL_STACKS: dict[str, list[str]] = {
     "matmul": [
+        # If the matmul is embedded in a chain (Level 2/3), delegate it to cuBLAS
+        # and fuse the epilogue -- that is the win. The write-your-own-gemm ladder
+        # below only applies to a STANDALONE matmul, where it still cannot beat
+        # cuBLAS but is the only thing to try.
+        "vendor_op_fused_epilogue",
         "shared_memory_tiling",
         "register_blocking",
         "vectorized_loads",
@@ -314,6 +340,10 @@ CANONICAL_STACKS: dict[str, list[str]] = {
         "double_buffering",
     ],
     "convolution": [
+        # Same as matmul: a conv embedded in a chain should be delegated to cuDNN
+        # (at::conv2d/at::conv3d) with the epilogue fused; the direct-conv ladder
+        # below is for a standalone conv.
+        "vendor_op_fused_epilogue",
         "shared_memory_tiling",
         "halo_tiling",
         "constant_memory_filters",
