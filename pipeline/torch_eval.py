@@ -76,12 +76,41 @@ class Task:
         return self._ref_model
 
     def inputs(self, seed: int = BASELINE_SEED) -> list[torch.Tensor]:
-        """Deterministic inputs on the GPU for a given seed."""
+        """Deterministic activation inputs on the GPU for a given seed."""
         torch.manual_seed(seed)
         return [
             x.cuda() if isinstance(x, torch.Tensor) else x
             for x in self.get_inputs()
         ]
+
+    def _named_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """
+        The module's learnable state, in a STABLE order: parameters first (in
+        registration order), then floating-point buffers (BatchNorm/InstanceNorm
+        running stats, etc.). `num_batches_tracked` and other non-float buffers
+        are skipped -- they are int counters the forward math never touches.
+        """
+        out = [(n, p) for n, p in self.ref_model.named_parameters()]
+        out += [(n, b) for n, b in self.ref_model.named_buffers()
+                if b is not None and b.dtype.is_floating_point]
+        return out
+
+    def params(self) -> list[torch.Tensor]:
+        """Parameter/buffer tensors the kernel needs, in the order forward() must
+        accept them (AFTER the activation inputs)."""
+        return [t.detach() for _, t in self._named_tensors()]
+
+    def param_specs(self) -> list[tuple[str, tuple, str]]:
+        """(name, shape, dtype) for each parameter/buffer, to describe the
+        forward() signature to the coder."""
+        return [(n, tuple(t.shape), str(t.dtype).replace("torch.", ""))
+                for n, t in self._named_tensors()]
+
+    def karma_args(self, seed: int = BASELINE_SEED) -> list[torch.Tensor]:
+        """Full positional args for a KARMA kernel: activation inputs THEN params.
+        The reference module is called with just inputs (it holds its own params),
+        but the extension is a free function so the params must be handed to it."""
+        return [*self.inputs(seed), *self.params()]
 
     @torch.no_grad()
     def expected(self, seed: int = BASELINE_SEED) -> torch.Tensor:
@@ -333,12 +362,16 @@ def validate(mod, task: Task) -> tuple[bool, str]:
     Intermediates are freed between seeds: these tasks are large enough that
     holding three seeds' worth of inputs+outputs at once will OOM on a small card.
     """
+    # The kernel is a free function, so it needs the module's params handed to it
+    # explicitly; the reference module holds its own. These are constant across seeds.
+    params = task.params()
+
     # Gate A
     for seed in VALIDATION_SEEDS:
         try:
             inputs = task.inputs(seed)
             expected = task.ref_model(*inputs)
-            got = mod.forward(*inputs)
+            got = mod.forward(*inputs, *params)
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             return False, f"Out of memory validating seed {seed} (task too large for this GPU)."
@@ -367,8 +400,8 @@ def validate(mod, task: Task) -> tuple[bool, str]:
     # Gate B
     try:
         inputs = task.inputs(BASELINE_SEED)
-        first = _as_tuple(mod.forward(*inputs))
-        second = _as_tuple(mod.forward(*inputs))
+        first = _as_tuple(mod.forward(*inputs, *params))
+        second = _as_tuple(mod.forward(*inputs, *params))
     except torch.OutOfMemoryError:
         torch.cuda.empty_cache()
         return False, "Out of memory during determinism check (task too large for this GPU)."
@@ -398,18 +431,23 @@ def benchmark_interleaved(
     other, silently attributes any drift to the second.
     """
     inputs = task.inputs(BASELINE_SEED)
+    params = task.params()
     model = task.ref_model
 
+    # zero-arg closures: eager takes only inputs, the kernel takes inputs + params
+    run_eager = lambda: model(*inputs)
+    run_karma = lambda: mod.forward(*inputs, *params)
+
     for _ in range(warmup):
-        model(*inputs)
-        mod.forward(*inputs)
+        run_eager()
+        run_karma()
     torch.cuda.synchronize()
 
     def _one(fn) -> float:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        fn(*inputs)
+        fn()
         end.record()
         torch.cuda.synchronize()
         return start.elapsed_time(end)
@@ -417,9 +455,9 @@ def benchmark_interleaved(
     eager, karma = [], []
     while len(karma) < runs:
         for _ in range(min(block, runs - len(eager))):
-            eager.append(_one(model))
+            eager.append(_one(run_eager))
         for _ in range(min(block, runs - len(karma))):
-            karma.append(_one(mod.forward))
+            karma.append(_one(run_karma))
 
     karma_ms = statistics.fmean(karma)
     eager_ms = statistics.fmean(eager)
@@ -478,25 +516,28 @@ def run_off(
 
     refs = refs or {}
     inputs = task.inputs(BASELINE_SEED)
+    params = task.params()
     model = task.ref_model
 
-    # Every arm is a zero-arg callable timed identically.
-    arms: list[tuple[str, object]] = [("eager", model)]
+    # Every arm is a ZERO-ARG closure. eager and the reference arms (torch.compile)
+    # take only the activation inputs; a KARMA kernel takes inputs + params.
+    arms: list[tuple[str, object]] = [("eager", lambda: model(*inputs))]
     for rname, rfn in refs.items():
-        arms.append((rname, rfn))
+        arms.append((rname, (lambda f=rfn: f(*inputs))))
     for i, c in enumerate(candidates):
-        arms.append((f"cand{i}", c["mod"].forward))
+        m = c["mod"]
+        arms.append((f"cand{i}", (lambda mm=m: mm.forward(*inputs, *params))))
 
     for _ in range(warmup):
         for _, fn in arms:
-            fn(*inputs)
+            fn()
     torch.cuda.synchronize()
 
     def _one(fn) -> float:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        fn(*inputs)
+        fn()
         end.record()
         torch.cuda.synchronize()
         return start.elapsed_time(end)

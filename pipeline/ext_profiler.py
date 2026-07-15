@@ -33,9 +33,8 @@ mod, err = compile_extension(spec["cuda"], spec["cpp"])
 if mod is None:
     print("EXT_BUILD_FAILED", err[:200]); sys.exit(1)
 
-inputs = task.inputs(42)
 with torch.no_grad():
-    mod.forward(*inputs)          # the one launch ncu profiles
+    mod.forward(*task.karma_args(42))    # inputs + params; the one launch ncu profiles
 torch.cuda.synchronize()
 '''
 

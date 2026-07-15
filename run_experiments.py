@@ -76,7 +76,7 @@ from config import load_config, ConfigError
 from Agents.providers import build_provider
 
 # agents — each owns its class, prompt, provider and session id
-from Agents.coder import CoderAgent
+from Agents.coder import CoderAgent, build_signature_ctx
 from Agents.classifier import ClassifierAgent, append_classifier_log
 from Agents.planner import PlanningAgent
 
@@ -312,13 +312,26 @@ async def optimize_one_torch(py_file: Path) -> dict:
           f"compile: {cmp_txt}  peak: {peak_gb:.2f}GB")
 
     # ── ROUND 0: faithful translation ──────────────────────────────────
+    # forward() must accept the activation inputs AND the module's parameters
+    # (Linear/Conv weights, norm affine + running stats). The kernel is a free
+    # function, so Python passes them explicitly; the coder is told the exact
+    # ordered signature. Without this, any task with learned weights fails with a
+    # TypeError at call time.
+    input_specs = [(f"x{i}", tuple(t.shape), str(t.dtype).replace("torch.", ""))
+                   for i, t in enumerate(task.inputs())]
+    param_specs = task.param_specs()
+    signature_ctx = build_signature_ctx(input_specs, param_specs)
+    if param_specs:
+        print(f"  signature: {len(input_specs)} input(s) + {len(param_specs)} parameter(s)")
+
     cuda_src = cpp_src = None
     err_fb = ""
     translate_retries = 0
 
     for attempt in range(1, EVAL.translate_retries + 1):
         print(f"  round 0 (translate) attempt {attempt}/{EVAL.translate_retries}...")
-        out = await coder.translate(task.source, gpu_arch=GPU_ARCH, error_feedback=err_fb)
+        out = await coder.translate(task.source, gpu_arch=GPU_ARCH,
+                                    signature_ctx=signature_ctx, error_feedback=err_fb)
         if not out:
             err_fb = "Your reply could not be parsed as the required JSON object."
             translate_retries = attempt
@@ -492,7 +505,7 @@ async def optimize_one_torch(py_file: Path) -> dict:
             round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
             pytorch_source=task.source, guidance=guidance, metrics_ctx=metrics_ctx,
             kb_ctx=kb_ctx, history_ctx=history_ctx, best_ctx=best_ctx,
-            error_feedback=err_fb, applied=applied,
+            error_feedback=err_fb, signature_ctx=signature_ctx, applied=applied,
         )
         if not out:
             print(f"  round {r}: unparseable reply")
