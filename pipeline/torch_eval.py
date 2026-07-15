@@ -391,15 +391,18 @@ def validate(mod, task: Task) -> tuple[bool, str]:
                 diff = (g.float() - e.float()).abs().max().item()
                 escale = e.float().abs().mean().item() or 1.0
                 hint = ""
-                # A small systematic error (well under 1% of the output scale) is
-                # almost never a logic bug -- it is a precision bug. Point the coder
-                # at the usual causes instead of just reporting the magnitude, which
-                # on its own it cannot act on (observed: 3 identical failed retries).
+                # A small systematic error (well under the output scale) is a subtle
+                # numerical mismatch, not a gross logic bug. The magnitude alone is not
+                # actionable (observed: 3 identical failed retries), so name the usual
+                # causes. #1 by far: a reimplemented library op. A hand-written conv or
+                # matmul CANNOT match cuDNN/cuBLAS (Winograd/implicit-GEMM) within the
+                # tolerance -- it must be delegated to the torch op.
                 if diff < 0.05 * escale:
-                    hint = (" This is a SMALL systematic error, i.e. a precision bug, not a "
-                            "logic bug: use a numerically stable TWO-PASS/Welford variance "
-                            "(not E[x^2]-E[x]^2), match the op's epsilon exactly, and "
-                            "accumulate reductions in float.")
+                    hint = (" This is a SMALL systematic mismatch. Most likely cause: you "
+                            "REIMPLEMENTED a library op (convolution/matmul/pooling) whose "
+                            "output cannot match cuDNN/cuBLAS by hand — call at::conv2d / "
+                            "at::linear / at::matmul instead. Otherwise: an unstable variance "
+                            "formula (use two-pass/Welford, not E[x^2]-E[x]^2) or a wrong epsilon.")
                 return False, (
                     f"Incorrect on seed {seed} (output {i}): max abs diff {diff:.3e} "
                     f"exceeds tolerance rtol={rtol:g} atol={atol:g}.{hint}"
