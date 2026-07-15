@@ -76,12 +76,41 @@ class Task:
         return self._ref_model
 
     def inputs(self, seed: int = BASELINE_SEED) -> list[torch.Tensor]:
-        """Deterministic inputs on the GPU for a given seed."""
+        """Deterministic activation inputs on the GPU for a given seed."""
         torch.manual_seed(seed)
         return [
             x.cuda() if isinstance(x, torch.Tensor) else x
             for x in self.get_inputs()
         ]
+
+    def _named_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """
+        The module's learnable state, in a STABLE order: parameters first (in
+        registration order), then floating-point buffers (BatchNorm/InstanceNorm
+        running stats, etc.). `num_batches_tracked` and other non-float buffers
+        are skipped -- they are int counters the forward math never touches.
+        """
+        out = [(n, p) for n, p in self.ref_model.named_parameters()]
+        out += [(n, b) for n, b in self.ref_model.named_buffers()
+                if b is not None and b.dtype.is_floating_point]
+        return out
+
+    def params(self) -> list[torch.Tensor]:
+        """Parameter/buffer tensors the kernel needs, in the order forward() must
+        accept them (AFTER the activation inputs)."""
+        return [t.detach() for _, t in self._named_tensors()]
+
+    def param_specs(self) -> list[tuple[str, tuple, str]]:
+        """(name, shape, dtype) for each parameter/buffer, to describe the
+        forward() signature to the coder."""
+        return [(n, tuple(t.shape), str(t.dtype).replace("torch.", ""))
+                for n, t in self._named_tensors()]
+
+    def karma_args(self, seed: int = BASELINE_SEED) -> list[torch.Tensor]:
+        """Full positional args for a KARMA kernel: activation inputs THEN params.
+        The reference module is called with just inputs (it holds its own params),
+        but the extension is a free function so the params must be handed to it."""
+        return [*self.inputs(seed), *self.params()]
 
     @torch.no_grad()
     def expected(self, seed: int = BASELINE_SEED) -> torch.Tensor:
@@ -199,14 +228,16 @@ def measure_baselines(task: Task, warmup: int = 10, runs: int = 30) -> dict:
     eager_ms, eager_std = _time_callable(model, inputs, warmup, runs)
 
     compile_ms = compile_std = None
+    compiled = None
     compile_note = ""
     if not torch_compile_available():
-        compile_note = "triton not installed (no Windows wheel) — torch.compile baseline unavailable"
+        compile_note = "triton not installed — torch.compile baseline unavailable"
     else:
         try:
             compiled = torch.compile(model)
             compile_ms, compile_std = _time_callable(compiled, inputs, warmup, runs)
         except Exception as e:
+            compiled = None
             compile_note = f"torch.compile failed: {e.__class__.__name__}"
 
     if compile_note:
@@ -227,6 +258,11 @@ def measure_baselines(task: Task, warmup: int = 10, runs: int = 30) -> dict:
         "compile_ms": compile_ms,
         "compile_std": compile_std,
         "compile_note": compile_note,
+        # The compiled callable itself, so the end-of-run run-off can race it in
+        # the same sitting as the kernel. compile_ms alone is measured here, at the
+        # START, and comparing it to a kernel timed minutes later is exactly the
+        # thermal-drift error the run-off exists to eliminate.
+        "compiled": compiled,
         "peak_gb": peak_gb,
         "spilled": spilled,
         "expected": expected,
@@ -282,13 +318,28 @@ def compile_extension(
             verbose=False,
         )
 
+    # NOTE on the timeout: `with ThreadPoolExecutor(...)` calls shutdown(wait=True)
+    # on exit, so a TimeoutError raised inside the block would still BLOCK until the
+    # build finished -- the timeout enforced nothing, it just waited the full build
+    # and then discarded a compile that had actually succeeded. (Observed: three
+    # "timed out after 180s" translate attempts, 12 minutes of wall clock, all of
+    # them builds that in fact completed.) Python cannot kill a running thread, so
+    # instead we shut the pool down WITHOUT waiting and let the orphan finish in the
+    # background -- it only populates torch's on-disk cache, which makes the next
+    # attempt at the same source instant.
+    pool = ThreadPoolExecutor(max_workers=1)
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(_build).result(timeout=timeout_s), ""
+        fut = pool.submit(_build)
+        return fut.result(timeout=timeout_s), ""
     except FuturesTimeout:
-        return None, f"Compilation timed out after {timeout_s}s (hung compiler)."
+        return None, (
+            f"Compilation exceeded {timeout_s}s. The build may still be running in "
+            f"the background; retrying the same source will likely hit torch's cache."
+        )
     except Exception as e:
         return None, f"{e.__class__.__name__}: {e}"
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ── Correctness ────────────────────────────────────────────────────────
@@ -311,12 +362,16 @@ def validate(mod, task: Task) -> tuple[bool, str]:
     Intermediates are freed between seeds: these tasks are large enough that
     holding three seeds' worth of inputs+outputs at once will OOM on a small card.
     """
+    # The kernel is a free function, so it needs the module's params handed to it
+    # explicitly; the reference module holds its own. These are constant across seeds.
+    params = task.params()
+
     # Gate A
     for seed in VALIDATION_SEEDS:
         try:
             inputs = task.inputs(seed)
             expected = task.ref_model(*inputs)
-            got = mod.forward(*inputs)
+            got = mod.forward(*inputs, *params)
         except torch.OutOfMemoryError:
             torch.cuda.empty_cache()
             return False, f"Out of memory validating seed {seed} (task too large for this GPU)."
@@ -334,9 +389,23 @@ def validate(mod, task: Task) -> tuple[bool, str]:
                 torch.testing.assert_close(g, e, rtol=rtol, atol=atol, check_dtype=False)
             except AssertionError:
                 diff = (g.float() - e.float()).abs().max().item()
+                escale = e.float().abs().mean().item() or 1.0
+                hint = ""
+                # A small systematic error (well under the output scale) is a subtle
+                # numerical mismatch, not a gross logic bug. The magnitude alone is not
+                # actionable (observed: 3 identical failed retries), so name the usual
+                # causes. #1 by far: a reimplemented library op. A hand-written conv or
+                # matmul CANNOT match cuDNN/cuBLAS (Winograd/implicit-GEMM) within the
+                # tolerance -- it must be delegated to the torch op.
+                if diff < 0.05 * escale:
+                    hint = (" This is a SMALL systematic mismatch. Most likely cause: you "
+                            "REIMPLEMENTED a library op (convolution/matmul/pooling) whose "
+                            "output cannot match cuDNN/cuBLAS by hand — call at::conv2d / "
+                            "at::linear / at::matmul instead. Otherwise: an unstable variance "
+                            "formula (use two-pass/Welford, not E[x^2]-E[x]^2) or a wrong epsilon.")
                 return False, (
                     f"Incorrect on seed {seed} (output {i}): max abs diff {diff:.3e} "
-                    f"exceeds tolerance rtol={rtol:g} atol={atol:g}."
+                    f"exceeds tolerance rtol={rtol:g} atol={atol:g}.{hint}"
                 )
 
         del inputs, expected, got
@@ -345,8 +414,8 @@ def validate(mod, task: Task) -> tuple[bool, str]:
     # Gate B
     try:
         inputs = task.inputs(BASELINE_SEED)
-        first = _as_tuple(mod.forward(*inputs))
-        second = _as_tuple(mod.forward(*inputs))
+        first = _as_tuple(mod.forward(*inputs, *params))
+        second = _as_tuple(mod.forward(*inputs, *params))
     except torch.OutOfMemoryError:
         torch.cuda.empty_cache()
         return False, "Out of memory during determinism check (task too large for this GPU)."
@@ -376,18 +445,23 @@ def benchmark_interleaved(
     other, silently attributes any drift to the second.
     """
     inputs = task.inputs(BASELINE_SEED)
+    params = task.params()
     model = task.ref_model
 
+    # zero-arg closures: eager takes only inputs, the kernel takes inputs + params
+    run_eager = lambda: model(*inputs)
+    run_karma = lambda: mod.forward(*inputs, *params)
+
     for _ in range(warmup):
-        model(*inputs)
-        mod.forward(*inputs)
+        run_eager()
+        run_karma()
     torch.cuda.synchronize()
 
     def _one(fn) -> float:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        fn(*inputs)
+        fn()
         end.record()
         torch.cuda.synchronize()
         return start.elapsed_time(end)
@@ -395,9 +469,9 @@ def benchmark_interleaved(
     eager, karma = [], []
     while len(karma) < runs:
         for _ in range(min(block, runs - len(eager))):
-            eager.append(_one(model))
+            eager.append(_one(run_eager))
         for _ in range(min(block, runs - len(karma))):
-            karma.append(_one(mod.forward))
+            karma.append(_one(run_karma))
 
     karma_ms = statistics.fmean(karma)
     eager_ms = statistics.fmean(eager)
@@ -424,6 +498,7 @@ def run_off(
     warmup: int = 10,
     runs: int = 30,
     trials: int = 3,
+    refs: dict | None = None,
 ) -> dict:
     """
     Re-measure several candidate kernels BACK-TO-BACK and pick the true winner.
@@ -440,53 +515,65 @@ def run_off(
     round-robin across `trials` so drift is spread evenly over all of them rather
     than accumulating on whoever went last.
 
+    `refs` are extra reference arms raced alongside the candidates -- pass
+    {"compile": compiled_model} so speedup_vs_compile is measured in the SAME
+    sitting as the kernel. Without that it suffers precisely the bug this function
+    exists to fix: compile_ms was measured once in measure_baselines() at the start
+    and the kernel minutes later, which inflated a true 1.07x to a reported 1.38x.
+
     candidates: [{"round": int, "mod": module, "cuda": str, "cpp": str, ...}, ...]
-    Returns the winning candidate dict, augmented with the fresh measurement.
+    Returns the winning candidate dict, augmented with the fresh measurement and a
+    `ref_ms` map of the reference arms.
     """
     if not candidates:
         return {}
-    if len(candidates) == 1:
-        c = dict(candidates[0])
-        b = benchmark_interleaved(c["mod"], task, warmup=warmup, runs=runs)
-        c.update(karma_ms=b["karma_ms"], karma_std=b["karma_std"],
-                 eager_ms=b["eager_ms"], speedup_vs_eager=b["speedup_vs_eager"])
-        return c
 
+    refs = refs or {}
     inputs = task.inputs(BASELINE_SEED)
+    params = task.params()
     model = task.ref_model
 
+    # Every arm is a ZERO-ARG closure. eager and the reference arms (torch.compile)
+    # take only the activation inputs; a KARMA kernel takes inputs + params.
+    arms: list[tuple[str, object]] = [("eager", lambda: model(*inputs))]
+    for rname, rfn in refs.items():
+        arms.append((rname, (lambda f=rfn: f(*inputs))))
+    for i, c in enumerate(candidates):
+        m = c["mod"]
+        arms.append((f"cand{i}", (lambda mm=m: mm.forward(*inputs, *params))))
+
     for _ in range(warmup):
-        model(*inputs)
-        for c in candidates:
-            c["mod"].forward(*inputs)
+        for _, fn in arms:
+            fn()
     torch.cuda.synchronize()
 
     def _one(fn) -> float:
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        fn(*inputs)
+        fn()
         end.record()
         torch.cuda.synchronize()
         return start.elapsed_time(end)
 
-    samples: dict[int, list[float]] = {i: [] for i in range(len(candidates))}
-    eager: list[float] = []
+    samples: dict[str, list[float]] = {k: [] for k, _ in arms}
     per_trial = max(1, runs // trials)
 
-    # round-robin: eager, cand0, cand1, ... repeated. Drift hits everyone equally.
+    # round-robin over EVERY arm (eager, refs, candidates) so drift is spread
+    # evenly rather than accumulating on whoever runs last.
     for _ in range(trials):
         for _ in range(per_trial):
-            eager.append(_one(model))
-            for i, c in enumerate(candidates):
-                samples[i].append(_one(c["mod"].forward))
+            for k, fn in arms:
+                samples[k].append(_one(fn))
 
-    eager_ms = statistics.fmean(eager)
+    eager_ms = statistics.fmean(samples["eager"])
+    ref_ms = {k: statistics.fmean(samples[k]) for k in refs}
 
     scored = []
     for i, c in enumerate(candidates):
-        ms = statistics.fmean(samples[i])
-        sd = statistics.pstdev(samples[i]) if len(samples[i]) > 1 else 0.0
+        s = samples[f"cand{i}"]
+        ms = statistics.fmean(s)
+        sd = statistics.pstdev(s) if len(s) > 1 else 0.0
         scored.append((eager_ms / ms if ms > 0 else 0.0, ms, sd, i))
 
     scored.sort(reverse=True)
@@ -494,6 +581,12 @@ def run_off(
 
     winner = dict(candidates[idx])
     winner.update(karma_ms=ms, karma_std=sd, eager_ms=eager_ms, speedup_vs_eager=speedup)
+    winner["ref_ms"] = ref_ms
+    # Reference speedups measured in the SAME sitting as the winner, so they are
+    # directly comparable -- unlike a compile_ms captured minutes earlier.
+    winner["speedup_vs_ref"] = {
+        k: (v / ms if ms > 0 else 0.0) for k, v in ref_ms.items()
+    }
     winner["runoff"] = [
         {"round": candidates[i]["round"], "karma_ms": m, "speedup_vs_eager": s}
         for s, m, _, i in scored
