@@ -389,9 +389,20 @@ def validate(mod, task: Task) -> tuple[bool, str]:
                 torch.testing.assert_close(g, e, rtol=rtol, atol=atol, check_dtype=False)
             except AssertionError:
                 diff = (g.float() - e.float()).abs().max().item()
+                escale = e.float().abs().mean().item() or 1.0
+                hint = ""
+                # A small systematic error (well under 1% of the output scale) is
+                # almost never a logic bug -- it is a precision bug. Point the coder
+                # at the usual causes instead of just reporting the magnitude, which
+                # on its own it cannot act on (observed: 3 identical failed retries).
+                if diff < 0.05 * escale:
+                    hint = (" This is a SMALL systematic error, i.e. a precision bug, not a "
+                            "logic bug: use a numerically stable TWO-PASS/Welford variance "
+                            "(not E[x^2]-E[x]^2), match the op's epsilon exactly, and "
+                            "accumulate reductions in float.")
                 return False, (
                     f"Incorrect on seed {seed} (output {i}): max abs diff {diff:.3e} "
-                    f"exceeds tolerance rtol={rtol:g} atol={atol:g}."
+                    f"exceeds tolerance rtol={rtol:g} atol={atol:g}.{hint}"
                 )
 
         del inputs, expected, got

@@ -87,6 +87,12 @@ CORRECTNESS_RULES = """CUDA CORRECTNESS RULES — violating these silently produ
 - Never read shared memory a thread never wrote for the current tile.
 - Do not assume the input is contiguous — call .contiguous() or handle strides.
 - Match PyTorch's dtype. Do not hardcode float if the task may be another dtype.
+- NUMERICALLY STABLE VARIANCE (LayerNorm/InstanceNorm/GroupNorm/BatchNorm/softmax):
+  compute variance in TWO passes — first the mean, then the mean of (x-mean)^2 —
+  or use Welford. The one-pass E[x^2]-E[x]^2 formula loses ~1e-3 to catastrophic
+  cancellation in fp32 over a large reduction and will FAIL the tolerance check.
+  Match the op's epsilon EXACTLY (nn.*Norm default eps=1e-5, applied as
+  1/sqrt(var+eps)). Accumulate reductions in float even for lower-precision inputs.
 """
 
 
