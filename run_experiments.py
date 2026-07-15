@@ -73,7 +73,7 @@ from pipeline.ext_profiler import profile_extension
 
 # config + providers (LLM-agnostic: each agent picks its own provider/model)
 from config import load_config, ConfigError
-from Agents.providers import build_provider
+from Agents.providers import build_provider, LLMError
 
 # agents — each owns its class, prompt, provider and session id
 from Agents.coder import CoderAgent, build_signature_ctx
@@ -330,8 +330,13 @@ async def optimize_one_torch(py_file: Path) -> dict:
 
     for attempt in range(1, EVAL.translate_retries + 1):
         print(f"  round 0 (translate) attempt {attempt}/{EVAL.translate_retries}...")
-        out = await coder.translate(task.source, gpu_arch=GPU_ARCH,
-                                    signature_ctx=signature_ctx, error_feedback=err_fb)
+        try:
+            out = await coder.translate(task.source, gpu_arch=GPU_ARCH,
+                                        signature_ctx=signature_ctx, error_feedback=err_fb)
+        except LLMError as e:
+            print(f"    coder unavailable — {e}")
+            translate_retries = attempt
+            continue
         if not out:
             err_fb = "Your reply could not be parsed as the required JSON object."
             translate_retries = attempt
@@ -500,13 +505,22 @@ async def optimize_one_torch(py_file: Path) -> dict:
         # records as having failed; on success they become part of the stack.
         attempted = add_techs or ([strategy] if strategy != "agent_choice" else [])
 
-        out = await coder.optimize(
-            best_cuda, best_cpp,
-            round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
-            pytorch_source=task.source, guidance=guidance, metrics_ctx=metrics_ctx,
-            kb_ctx=kb_ctx, history_ctx=history_ctx, best_ctx=best_ctx,
-            error_feedback=err_fb, signature_ctx=signature_ctx, applied=applied,
-        )
+        try:
+            out = await coder.optimize(
+                best_cuda, best_cpp,
+                round_num=r, rounds=ROUNDS, gpu_arch=GPU_ARCH,
+                pytorch_source=task.source, guidance=guidance, metrics_ctx=metrics_ctx,
+                kb_ctx=kb_ctx, history_ctx=history_ctx, best_ctx=best_ctx,
+                error_feedback=err_fb, signature_ctx=signature_ctx, applied=applied,
+            )
+        except LLMError as e:
+            # Provider gave up after its own retries (usually a transient API
+            # timeout). Skip this round rather than crash the run and throw away
+            # every kernel found so far — the run-off below still ships the best.
+            print(f"  round {r}: coder unavailable — {e}")
+            history.append({"round": r, "result": "llm_error", "strategy": strategy})
+            continue
+
         if not out:
             print(f"  round {r}: unparseable reply")
             history.append({"round": r, "result": "empty_response", "strategy": strategy})
