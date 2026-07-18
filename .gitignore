@@ -8,7 +8,11 @@ kernels/
 __pycache__/
 *.pyc
 
+# Runtime state — moved between machines via the karma_state_*.tar.gz archive,
+# not git (binary DBs and append-only logs don't belong in history).
 knowledge/db/
+knowledge/db_backup_*/
 *.sqlite3
+results/classifier_log.csv
 
 kernels/tmp_*.cu
