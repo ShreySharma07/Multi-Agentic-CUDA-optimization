@@ -15,7 +15,7 @@ from matplotlib.ticker import FuncFormatter
 
 # kernel -> (eager_ms, compile_ms | None, karma_ms)
 BENCH = {
-    "LayerNorm":            (7.25,    None,   4.95),
+    "LayerNorm":            (8.31,    10.09,  6.23),
     "MinGPT GELU":          (28.25,   3.41,   3.14),
     "Matmul + Residual":    (26.17,   24.40,  23.84),
     "Conv2d + InstanceNorm": (1192.51, 609.25, 493.98),

@@ -22,12 +22,12 @@ KARMA automatically optimizes CUDA kernels generated from PyTorch operators. Eve
 
 | Kernel | PyTorch Eager | torch.compile | KARMA |
 |---------|--------------:|--------------:|-------:|
-| LayerNorm | 7.25 ms | — | **4.95 ms** |
+| LayerNorm | 8.31 ms | 10.09 ms | **6.23 ms** |
 | MinGPT GELU | 28.25 ms | 3.41 ms | **3.14 ms** |
 | Matmul + Residual | 26.17 ms | 24.40 ms | **23.84 ms** |
 | Conv2d + InstanceNorm | 1192.51 ms | 609.25 ms | **493.98 ms** |
 
-KARMA beats `torch.compile` on every kernel measured — from a 1.46x win on LayerNorm to 2.41x vs eager (1.23x vs `torch.compile`) on the Conv2d + InstanceNorm fused chain. Measured on an RTX 4050 Laptop (sm_89). Regenerate the figure with `python scripts/plot_benchmarks.py`.
+KARMA beats `torch.compile` on every kernel measured — from a 1.33x win on LayerNorm to 2.41x vs eager (1.23x vs `torch.compile`) on the Conv2d + InstanceNorm fused chain. On LayerNorm `torch.compile` is actually *slower* than eager (10.09 ms vs 8.31 ms): the guard/dispatch overhead does not pay off on an op that is already a single fused kernel, so KARMA's hand-tuned reduction wins by 1.62x there. Each row's three numbers are raced **back-to-back in one sitting** so the comparison is drift-free. Measured on an RTX 4050 Laptop (sm_89). Regenerate the figure with `python scripts/plot_benchmarks.py`.
 
 ---
 

@@ -245,6 +245,69 @@ def safe_float(val, default=0.0) -> float:
         return default
 
 
+# A genuine compiler diagnostic: nvcc/gcc "file(line): error:" or ": error:",
+# MSVC "error C####:", linker "unresolved external"/"undefined reference", or
+# nvcc's "N errors detected" summary. ninja's "build stopped" is the tail anchor.
+_DIAG_RE = re.compile(
+    r"(\berror\s*:|:\s*error\s+C\d+|\berror\s+C\d+\s*:|\bfatal\s+error\b"
+    r"|\d+\s+error[s]?\s+detected|unresolved\s+external|undefined\s+reference"
+    r"|ninja:\s*build\s+stopped)", re.I)
+
+# Lines that CONTAIN "error" but are noise, not diagnostics: torch's wrapper
+# ("Error building extension ... [1/3] cl /showIncludes ...") and the raw
+# compiler invocations (kilobyte-long nvcc/cl command lines). These must never
+# be mistaken for the diagnosis — they were what buried the real error before.
+_NOISE_RE = re.compile(
+    r"(building\s+extension|/showIncludes|-Xco|-Xcu|\bnvcc\b|\bcl\b\s|\.exe\b"
+    r"|TORCH_EXTENSION_NAME|Optimizing\s+Compiler|Copyright|/Fo|/std:)", re.I)
+
+
+def _is_diag(line: str) -> bool:
+    return bool(_DIAG_RE.search(line)) and not _NOISE_RE.search(line)
+
+
+def salient_compiler_error(cerr: str, budget: int = 2000) -> str:
+    """Distil a build log down to what an LLM needs to repair the code.
+
+    A naive ``cerr[:budget]`` feeds the model only the leading header warnings;
+    it never sees the actual ``error:`` line and regenerates the same broken code
+    every retry. Surface each genuine diagnostic (plus a few following lines —
+    nvcc prints candidate overloads and the offending source line right after),
+    while excluding the noise that looks like an error but isn't: torch's
+    "Error building extension" wrapper and the raw kilobyte-long compiler command
+    lines. Bias to the FIRST error (later ones usually cascade from it).
+    """
+    if not cerr:
+        return ""
+    lines = cerr.splitlines()
+    keep, i, n = [], 0, len(lines)
+    while i < n:
+        if _is_diag(lines[i]):
+            block = [lines[i]]
+            # pull following context until a blank line or the next noise line
+            j = i + 1
+            while j < n and j < i + 6 and lines[j].strip() and not _NOISE_RE.search(lines[j]):
+                block.append(lines[j])
+                j += 1
+            keep.append("\n".join(block))
+            i = max(j, i + 1)
+        else:
+            i += 1
+    if not keep:                              # unknown toolchain: fall back to the tail
+        return "\n".join(lines[-15:])[-budget:]
+    return ("\n---\n".join(keep))[:budget]    # keep the head — the root-cause error
+
+
+def first_error_line(cerr: str) -> str:
+    """The single most informative line for a one-line console print."""
+    if not cerr:
+        return "?"
+    for ln in cerr.splitlines():
+        if _is_diag(ln) and "warning" not in ln.lower():
+            return ln.strip()[:80]
+    return cerr.splitlines()[0][:80]
+
+
 async def _reflect_and_store(*, kernel_name, bottleneck, round_num, code, result,
                              speedup=0.0, error="", applied=None,
                              baseline="PyTorch eager (cuBLAS/cuDNN)"):
@@ -346,8 +409,8 @@ async def optimize_one_torch(py_file: Path) -> dict:
             out["cuda_source"], out["cpp_source"], timeout_s=EVAL.compile_timeout_s
         )
         if mod is None:
-            print(f"    compile failed: {cerr.splitlines()[0][:70] if cerr else '?'}")
-            err_fb = f"COMPILER ERROR:\n{cerr[:2000]}"
+            print(f"    compile failed: {first_error_line(cerr)}")
+            err_fb = f"COMPILER ERROR:\n{salient_compiler_error(cerr)}"
             translate_retries = attempt
             continue
 
@@ -532,9 +595,9 @@ async def optimize_one_torch(py_file: Path) -> dict:
             out["cuda_source"], out["cpp_source"], timeout_s=EVAL.compile_timeout_s
         )
         if mod is None:
-            print(f"  round {r}: COMPILE FAILED — {cerr.splitlines()[0][:60] if cerr else '?'}")
+            print(f"  round {r}: COMPILE FAILED — {first_error_line(cerr)}")
             history.append({"round": r, "result": "compile_failed", "strategy": strategy})
-            err_fb = f"COMPILER ERROR:\n{cerr[:2000]}"
+            err_fb = f"COMPILER ERROR:\n{salient_compiler_error(cerr)}"
             # On a failure, record the techniques that were ATTEMPTED — that is what
             # a future planner needs in order to avoid them.
             await _reflect_and_store(kernel_name=name, bottleneck=hint, round_num=r,
@@ -1088,7 +1151,7 @@ def find_kernelbench_path() -> Path | None:
     return None
 
 
-async def run_kernelbench(level: int = 1, max_kernels: int = 10):
+async def run_kernelbench(level: int = 1, max_kernels: int = 10, task: str = None):
     kb_base = find_kernelbench_path()
     if not kb_base:
         print("KernelBench not found. Run: git clone https://github.com/ScalingIntelligence/KernelBench")
@@ -1099,8 +1162,19 @@ async def run_kernelbench(level: int = 1, max_kernels: int = 10):
         print(f"Level {level} not found. Available: {list(kb_base.iterdir())}")
         return
 
-    files = sorted(kb_path.glob("*.py"))[:max_kernels]
-    print(f"Found {len(files)} tasks at {kb_path}")
+    # --task NAME runs a single named kernel (substring match on the file stem),
+    # so you can point the loop at one specific task instead of the first N.
+    all_files = sorted(kb_path.glob("*.py"))
+    if task:
+        files = [f for f in all_files if task.lower() in f.stem.lower()]
+        if not files:
+            print(f"No level-{level} task matching {task!r}. Available stems:")
+            for f in all_files:
+                print(f"  {f.stem}")
+            return
+    else:
+        files = all_files[:max_kernels]
+    print(f"Found {len(files)} task(s) at {kb_path}")
     Path("kernels/results").mkdir(parents=True, exist_ok=True)
 
     for py_file in files:
@@ -1183,10 +1257,12 @@ if __name__ == "__main__":
     elif mode == "kernelbench":
         level = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 1
         count = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 10
-        asyncio.run(run_kernelbench(level=level, max_kernels=count))
+        task = sys.argv[sys.argv.index("--task") + 1] if "--task" in sys.argv else None
+        asyncio.run(run_kernelbench(level=level, max_kernels=count, task=task))
     elif mode == "sglang":
         count = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 5
         asyncio.run(run_sglang(max_kernels=count))
     else:
         print("Usage: python run_experiments.py [own|kernelbench|sglang] [level] [max_kernels]")
+        print("       python run_experiments.py kernelbench <level> --task <name>   # one named kernel")
         print("Flags: --no-kb  --no-reflect  --no-classifier  --no-planner  --config <file.yaml>")
