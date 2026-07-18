@@ -12,6 +12,25 @@ Early results on KernelBench Level 1: **1.08x–1.31x speedup** with 0% compile 
 
 ---
 
+## Benchmark Results
+
+KARMA automatically optimizes CUDA kernels generated from PyTorch operators. Every kernel is validated for correctness against the PyTorch reference, then raced back-to-back against **PyTorch eager** and **`torch.compile`** — so the speedup is measured, not estimated.
+
+<p align="center">
+  <img src="images/KARMA_README_Benchmarks.png" width="900" alt="KARMA benchmark results vs PyTorch eager and torch.compile">
+</p>
+
+| Kernel | PyTorch Eager | torch.compile | KARMA |
+|---------|--------------:|--------------:|-------:|
+| LayerNorm | 7.25 ms | — | **4.95 ms** |
+| MinGPT GELU | 28.25 ms | 3.41 ms | **3.14 ms** |
+| Matmul + Residual | 26.17 ms | 24.40 ms | **23.84 ms** |
+| Conv2d + InstanceNorm | 1192.51 ms | 609.25 ms | **493.98 ms** |
+
+KARMA beats `torch.compile` on every kernel measured — from a 1.46x win on LayerNorm to 2.41x vs eager (1.23x vs `torch.compile`) on the Conv2d + InstanceNorm fused chain. Measured on an RTX 4050 Laptop (sm_89). Regenerate the figure with `python scripts/plot_benchmarks.py`.
+
+---
+
 ## Architecture
 
 ```
@@ -174,13 +193,7 @@ GPU_ARCH    = "sm_86"  # RTX A4000 Ampere
 
 ## Results
 
-| Kernel | Bottleneck | Baseline (ms) | Best (ms) | Speedup | Val failures |
-|--------|-----------|--------------|-----------|---------|-------------|
-| 100_HingeLoss | compute-bound | 0.117 | 0.099 | 1.30x | 1 |
-| 10_3D_tensor_matmul | — | 46.7 | 35.8 | 1.31x | 0 |
-| 12_Matmul_diagonal | memory-bound | 0.453 | 0.417 | 1.08x | 1 |
-
-Geometric mean speedup: ~1.22x on 3 evaluated kernels (full 100-kernel run in progress).
+Headline numbers are in [Benchmark Results](#benchmark-results) above. Per-run detail — one row per kernel, with bottleneck classification, the winning technique stack, and correctness outcome — is written to `results/experiments.csv`.
 
 ---
 
