@@ -26,7 +26,20 @@ def run_ncu_profile(binary: str):
             error_msg = result.stderr.strip()
             if not error_msg:
                 error_msg = result.stdout.strip()
-                
+
+            # By far the most common failure, and the raw dump buries the fix.
+            if "ERR_NVGPUCTRPERM" in error_msg:
+                return {"error": (
+                    "ERR_NVGPUCTRPERM: no permission to read GPU performance counters, "
+                    "so no profiler metrics are available (the pipeline will fall back to "
+                    "bottleneck='unknown').\n"
+                    "Fix on Windows, either:\n"
+                    "  (a) run this process from an Administrator shell, or\n"
+                    "  (b) set HKLM\\SYSTEM\\CurrentControlSet\\Services\\nvlddmkm\\Global\\NVTweak"
+                    "\\RmProfilingAdminOnly = 0 (DWORD) and reboot.\n"
+                    "See https://developer.nvidia.com/ERR_NVGPUCTRPERM"
+                )}
+
             return {"error": f"NCU Exit Code {result.returncode}:\n{error_msg}"}
 
         return {"profile": result.stdout}

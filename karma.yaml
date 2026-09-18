@@ -1,0 +1,85 @@
+# karma.yaml — KARMA agent / LLM configuration
+#
+# Safe to commit: this file never holds a secret. Each agent names the ENV VAR
+# that carries its API key (`api_key_env`); the key itself lives in .env, which
+# is gitignored.
+#
+# Every agent is independent: it may use a different provider, model, and key
+# from every other agent. Anything omitted under `agents:` falls back to
+# `defaults:`.
+#
+# Supported providers (SDK installed on demand — you only need the one you use):
+#   gemini     -> pip install google-genai        (installed)
+#   openai     -> pip install openai
+#   anthropic  -> pip install anthropic
+#   ollama     -> local server, no SDK, no API key
+#
+# Model id examples
+#   gemini:    gemini-2.5-flash, gemini-2.5-pro
+#   anthropic: claude-opus-4-8, claude-sonnet-5, claude-haiku-4-5-20251001
+#   openai:    gpt-4o, gpt-4o-mini
+#   ollama:    llama3.1, qwen2.5-coder:32b
+
+defaults:
+  provider: anthropic
+  model: claude-sonnet-5
+  api_key_env: CLAUDE_API_KEY   # must match the name used in your .env
+  temperature: 0.2
+  max_retries: 5
+  timeout: 120
+
+agents:
+  # Writes the CUDA. The expensive, quality-critical role — give it your
+  # strongest model.
+  coder:
+    model: claude-sonnet-5
+    temperature: 0.2
+
+  # One cheap call per kernel. Classification is an easy task; don't pay for it.
+  classifier:
+    model: claude-sonnet-5
+    temperature: 0.0        # deterministic labels
+
+  # One call per round. Benefits from reasoning, but the output is short.
+  planner:
+    model: claude-sonnet-5
+    temperature: 0.3        # a little exploration across rounds
+
+  # Summarises each round into a KB insight. Cheap and high-volume.
+  reflector:
+    model: claude-sonnet-5
+    temperature: 0.0
+
+# Torch-extension evaluation (kernelbench path). Python owns inputs, the
+# PyTorch correctness oracle and the clock — see pipeline/torch_eval.py.
+eval:
+  warmup: 10
+  runs: 30
+  translate_retries: 3          # round-0 attempts at a correct naive port
+  target_speedup_vs_compile: 1.05
+  compile_timeout_s: 600        # a cold nvcc+cl build is ~50s idle, but well over
+                                # 180s when the machine is loaded — and a timeout
+                                # throws away a build that usually succeeded
+  ncu_timeout_s: 300            # ncu is once per task; it timed out at 120s under load
+  # Per-round speedups are measured minutes apart and this GPU throttles (eager
+  # itself drifted 47ms -> 79ms during one run), so a later round can "win" merely
+  # because the baseline decayed faster. The top-N survivors are re-raced
+  # back-to-back at the end, round-robin, and that decides the winner.
+  runoff_finalists: 3
+  # Skip tasks whose peak memory exceeds this fraction of VRAM. On Windows the
+  # driver silently pages past VRAM into system RAM rather than raising, so an
+  # oversized task still "runs" while every timing measures PCIe, not the kernel.
+  # On a 6GB card this keeps 51/100 of KernelBench level1.
+  vram_headroom: 0.80
+
+# --- Mixing providers is the point. For example: ---
+#
+# agents:
+#   coder:
+#     provider: anthropic
+#     model: claude-opus-4-8
+#     api_key_env: ANTHROPIC_API_KEY   # then put ANTHROPIC_API_KEY=... in .env
+#   classifier:
+#     provider: ollama
+#     model: qwen2.5-coder:32b
+#     base_url: http://localhost:11434

@@ -1,4 +1,5 @@
 import subprocess
+import platform
 import torch
 import os
 from . import utils
@@ -12,6 +13,9 @@ def compile_cuda(file_path: str):
     abs_file_path = os.path.abspath(file_path)
     executable = abs_file_path.replace(".cu", "")
     arch = get_gpu_arch()
+
+    if platform.system() == "Windows":
+        executable += ".exe"
     
     nvcc_path = utils.find_cuda_tool('nvcc')
     

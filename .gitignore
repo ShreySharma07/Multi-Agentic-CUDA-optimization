@@ -5,3 +5,10 @@ bin
 KernelBench/
 sglang/
 kernels/
+__pycache__/
+*.pyc
+
+knowledge/db/
+*.sqlite3
+
+kernels/tmp_*.cu
