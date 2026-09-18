@@ -1,0 +1,143 @@
+.section {
+  padding: 120px 0 96px;
+}
+.intro {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 48px;
+  align-items: end;
+  margin-bottom: 56px;
+}
+.intro h2 {
+  max-width: 16ch;
+}
+.intro p {
+  max-width: 46ch;
+}
+.grid {
+  display: grid;
+  grid-template-columns: 0.95fr 1.05fr;
+  border: 1px solid var(--line);
+}
+.art {
+  position: relative;
+  min-height: 560px;
+  border-right: 1px solid var(--line);
+  overflow: hidden;
+  background: #0b0b0b;
+}
+.art canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.artTitle {
+  position: absolute;
+  top: 36px;
+  left: 36px;
+  right: 36px;
+  z-index: 2;
+  color: var(--ink);
+  mix-blend-mode: difference;
+}
+.rows {
+  display: flex;
+  flex-direction: column;
+}
+.row {
+  padding: 32px 36px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.row:last-child {
+  border-bottom: 0;
+}
+.row h3 {
+  font-size: clamp(20px, 1.6vw, 24px);
+  font-weight: 500;
+  letter-spacing: -0.015em;
+}
+.row p {
+  max-width: 60ch;
+}
+.row .chip-row,
+.chips {
+  margin-top: 8px;
+}
+.pipeline {
+  margin-top: 56px;
+  border: 1px solid var(--line);
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+.pipeStep {
+  padding: 22px 20px;
+  border-right: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  position: relative;
+}
+.pipeStep:last-child {
+  border-right: 0;
+}
+.pipeStep small {
+  color: var(--ink-4);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pipeStep b {
+  font-weight: 500;
+  font-size: 17px;
+  letter-spacing: -0.01em;
+}
+.pipeStep span {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.pipeStep::after {
+  content: "";
+  position: absolute;
+  right: -5px;
+  top: 30px;
+  width: 8px;
+  height: 8px;
+  border-top: 1px solid var(--line-3);
+  border-right: 1px solid var(--line-3);
+  transform: rotate(45deg);
+  background: var(--bg);
+  z-index: 1;
+}
+.pipeStep:last-child::after {
+  display: none;
+}
+@media (max-width: 960px) {
+  .intro,
+  .grid {
+    grid-template-columns: 1fr;
+  }
+  .art {
+    min-height: 360px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
+  .pipeline {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .pipeStep:nth-child(2n) {
+    border-right: 0;
+  }
+  .pipeStep:nth-child(-n + 4) {
+    border-bottom: 1px solid var(--line);
+  }
+  .pipeStep::after {
+    display: none;
+  }
+}
