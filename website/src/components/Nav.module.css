@@ -1,0 +1,111 @@
+.nav {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  height: 64px;
+  display: flex;
+  align-items: center;
+  background: rgba(5, 5, 5, 0.72);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line);
+}
+.inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+}
+.links {
+  display: flex;
+  gap: 32px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.links a {
+  color: var(--ink-2);
+  font-size: 15px;
+  letter-spacing: -0.005em;
+  transition: color 0.2s var(--ease);
+}
+.links a:hover {
+  color: var(--ink);
+}
+.right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: 1px solid var(--line-3);
+  object-fit: cover;
+}
+.user {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 38px;
+  padding: 0 6px 0 14px;
+  border: 1px solid var(--line-3);
+  border-radius: 999px;
+  font-size: 14px;
+  color: var(--ink-2);
+}
+.burger {
+  display: none;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--line-3);
+  border-radius: 50%;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink);
+}
+.sheet {
+  display: none;
+}
+@media (max-width: 900px) {
+  .links,
+  .hideMobile {
+    display: none;
+  }
+  .burger {
+    display: inline-flex;
+  }
+  .sheet {
+    display: flex;
+    flex-direction: column;
+    position: fixed;
+    inset: 64px 0 auto 0;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+    padding: 12px var(--gutter) 24px;
+    gap: 4px;
+    transform: translateY(-8px);
+    opacity: 0;
+    pointer-events: none;
+    transition:
+      opacity 0.2s var(--ease),
+      transform 0.2s var(--ease);
+  }
+  .sheetOpen {
+    opacity: 1;
+    transform: none;
+    pointer-events: auto;
+  }
+  .sheet a {
+    padding: 14px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 18px;
+    color: var(--ink-2);
+  }
+  .sheetActions {
+    display: flex;
+    gap: 10px;
+    padding-top: 16px;
+  }
+}

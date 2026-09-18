@@ -253,3 +253,6 @@ Experiments needed:
 Tested on: 2× NVIDIA RTX A4000 16GB (sm_86, Ampere)
 
 Minimum: any CUDA-capable GPU with sm_70+. Change `GPU_ARCH = "sm_86"` in `run_experiments.py` to match your hardware (`sm_80` for A100, `sm_90` for H100).
+## Website
+
+The public site, OAuth login and desktop early-access waitlist live in [`website/`](website/) (Next.js 16, deployed on Vercel). See [website/README.md](website/README.md).
