@@ -7,10 +7,13 @@ import { prisma } from "@/lib/prisma";
 
 const providers: Provider[] = [];
 
-if (process.env.AUTH_GITHUB_ID && process.env.AUTH_GITHUB_SECRET) {
+/** A variable counts as configured unless empty or the literal placeholder "skip". */
+const configured = (v: string | undefined) => Boolean(v && v.trim() && v.trim() !== "skip");
+
+if (configured(process.env.AUTH_GITHUB_ID) && configured(process.env.AUTH_GITHUB_SECRET)) {
   providers.push(GitHub);
 }
-if (process.env.AUTH_GOOGLE_ID && process.env.AUTH_GOOGLE_SECRET) {
+if (configured(process.env.AUTH_GOOGLE_ID) && configured(process.env.AUTH_GOOGLE_SECRET)) {
   providers.push(Google);
 }
 
