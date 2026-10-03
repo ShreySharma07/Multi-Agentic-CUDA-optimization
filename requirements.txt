@@ -10,6 +10,7 @@ pydantic>=2.0            # config + ExperimentResult schemas
 chromadb>=1.0            # KnowledgeBase vector store
 PyYAML>=6.0              # karma.yaml
 python-dotenv>=1.0       # API keys from .env
+pytest>=8.0              # tests/ (brain milestones run on CPU)
 
 # ── optional: profiler metric cache ────────────────────────────────────
 # pre_flight caches Nsight Compute metrics here. Entirely optional — the

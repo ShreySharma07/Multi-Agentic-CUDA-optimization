@@ -1,0 +1,89 @@
+# brain/catalog/models.yaml — FACTS tier: the models the brain can serve.
+#
+# Architecture numbers come from each model's config.json. `quality` is an
+# approximate MMLU score used ONLY to price the quality cost of swapping to a
+# smaller variant of the same family; replace it with your own eval if you have one.
+#
+# KV bytes per token = 2 (K and V) * n_layers * n_kv_heads * head_dim * dtype_bytes
+
+llama-3.2-1b:
+  hf_id: meta-llama/Llama-3.2-1B-Instruct
+  family: llama-3
+  params_b: 1.24
+  n_layers: 16
+  hidden: 2048
+  n_kv_heads: 8
+  head_dim: 64
+  max_context: 131072
+  quality: 49.3
+
+llama-3.2-3b:
+  hf_id: meta-llama/Llama-3.2-3B-Instruct
+  family: llama-3
+  params_b: 3.21
+  n_layers: 28
+  hidden: 3072
+  n_kv_heads: 8
+  head_dim: 128
+  max_context: 131072
+  quality: 63.4
+
+llama-3.1-8b:
+  hf_id: meta-llama/Llama-3.1-8B-Instruct
+  family: llama-3
+  params_b: 8.03
+  n_layers: 32
+  hidden: 4096
+  n_kv_heads: 8
+  head_dim: 128
+  max_context: 131072
+  quality: 69.4
+
+llama-3.1-70b:
+  hf_id: meta-llama/Llama-3.1-70B-Instruct
+  family: llama-3
+  params_b: 70.6
+  n_layers: 80
+  hidden: 8192
+  n_kv_heads: 8
+  head_dim: 128
+  max_context: 131072
+  quality: 83.6
+
+qwen2.5-7b:
+  hf_id: Qwen/Qwen2.5-7B-Instruct
+  family: qwen2.5
+  params_b: 7.6
+  n_layers: 28
+  hidden: 3584
+  n_kv_heads: 4
+  head_dim: 128
+  max_context: 32768
+  quality: 74.2
+
+qwen2.5-14b:
+  hf_id: Qwen/Qwen2.5-14B-Instruct
+  family: qwen2.5
+  params_b: 14.7
+  n_layers: 48
+  hidden: 5120
+  n_kv_heads: 8
+  head_dim: 128
+  max_context: 32768
+  quality: 79.7
+
+mixtral-8x7b:
+  hf_id: mistralai/Mixtral-8x7B-Instruct-v0.1
+  family: mixtral
+  params_b: 46.7
+  active_params_b: 12.9
+  n_layers: 32
+  hidden: 4096
+  n_kv_heads: 8
+  head_dim: 128
+  max_context: 32768
+  quality: 70.6
+  moe:
+    n_experts: 8
+    top_k: 2
+    shared_params_b: 1.6     # attention + embeddings, read every step

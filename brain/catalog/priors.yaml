@@ -1,0 +1,45 @@
+# brain/catalog/priors.yaml — FACTS tier: per-GPU strategy notes.
+#
+# These are EXPERT PRIORS, not truths. Later milestones (M4) load them into the
+# playbook as `hypothesis` rules that must earn promotion with evidence, so a
+# wrong prior here can never poison decisions — it just gets demoted.
+#
+# `when` keys are GPU/model/workload traits computed by brain/facts.py, so a
+# prior written for "low-bandwidth GPUs" transfers to any GPU with that trait.
+
+gpu_notes:
+  T4: "Old and cheap. No bf16/fp8 and only 320 GB/s, so decode is badly bandwidth-bound. Good only for <=3B models; prefer int4/int8 weights."
+  L4: "Low bandwidth (300 GB/s) but has fp8. fp8 weights + fp8 KV roughly halve bytes per token; large batches pay off. Poor for latency-strict decode."
+  A10G: "Mid bandwidth, no fp8. int8/int4 weights are the main lever; 24 GB limits KV for 8B models."
+  RTX4090: "Excellent $/bandwidth but 24 GB and PCIe-only: avoid tensor parallel, scale with replicas instead."
+  L40S: "48 GB, fp8, modest bandwidth. Cost-efficient for 8-14B models with fp8; poor at tensor parallel (PCIe)."
+  A100-40GB: "Strong bandwidth, no fp8. KV capacity is the usual limit for long contexts."
+  A100-80GB: "Balanced workhorse, no fp8. NVLink makes TP=2/4 viable for 70B."
+  H100-PCIe: "H100 compute with lower bandwidth and PCIe interconnect; prefer replicas over TP."
+  H100-SXM: "fp8 + 3.35 TB/s + NVLink. fp8 weights and KV usually dominate; TP is cheap here."
+  H200: "Same compute as H100 SXM, 141 GB and 4.8 TB/s: wins on long-context / KV-heavy workloads."
+  B200: "fp4 support and 8 TB/s. Expensive per hour; only cheapest per token at high utilization."
+  MI300X: "192 GB holds 70B on one GPU (no TP). Use vLLM ROCm build; fewer fused kernels than CUDA."
+
+rules:
+  - when: {gpu.fp8: true}
+    patch: {engine.kv_cache_dtype: fp8}
+    statement: "On fp8-capable GPUs, fp8 KV cache roughly doubles KV capacity at negligible quality cost."
+  - when: {gpu.fp8: true, model.size_class: medium}
+    patch: {fleet.precision: fp8}
+    statement: "fp8 weights on fp8 GPUs halve weight bytes and double matmul peak."
+  - when: {workload.prompt_class: long}
+    patch: {engine.enable_chunked_prefill: true}
+    statement: "Long prompts stall decodes; chunked prefill protects per-token latency."
+  - when: {workload.prefix_heavy: true}
+    patch: {engine.enable_prefix_caching: true, routing.policy: prefix_affinity}
+    statement: "Shared system prompts: cache the prefix and route same-prefix requests to the same replica."
+  - when: {gpu.bandwidth_class: low, workload.latency_strict: true}
+    patch: {engine.speculative: ngram}
+    statement: "Bandwidth-starved decode has idle compute; speculative decoding converts it into tokens."
+  - when: {gpu.interconnect: pcie}
+    patch: {fleet.tensor_parallel: 1}
+    statement: "Without NVLink, tensor parallel all-reduces dominate; scale out with replicas."
+  - when: {workload.bursty: true}
+    patch: {routing.policy: least_tokens}
+    statement: "Bursty arrivals need load-aware routing; round-robin piles bursts onto busy replicas."
