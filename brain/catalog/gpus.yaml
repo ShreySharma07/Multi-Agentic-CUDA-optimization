@@ -1,0 +1,175 @@
+# brain/catalog/gpus.yaml — FACTS tier: the hardware the brain can deploy on.
+#
+# Peak numbers are approximate public datasheet values, DENSE (no 2:4 sparsity),
+# in TFLOPS (TOPS for int8). They feed a roofline model, so only their RATIOS
+# matter much; real-vs-sim error is absorbed later by calibration from real runs.
+#
+# price_per_hour is an approximate on-demand marketplace price in USD (Oct 2026).
+# Prices drift weekly — edit them; the brain never hardcodes a price elsewhere.
+#
+# Fields:
+#   memory_gb       usable HBM/GDDR per GPU
+#   mem_bw_gbps     memory bandwidth, GB/s
+#   bf16_tflops     dense bf16 (fp16 on GPUs without bf16)
+#   fp8_tflops      null = no fp8 tensor cores
+#   int8_tops       dense int8
+#   fp4_tflops      null = no fp4 tensor cores
+#   link_gbps       effective per-GPU all-reduce bandwidth for tensor parallel
+#                   (NVLink / Infinity Fabric when present, else PCIe)
+#   max_tp          largest tensor-parallel group on one node
+
+T4:
+  arch: sm_75
+  memory_gb: 16
+  mem_bw_gbps: 320
+  bf16_tflops: 65        # fp16 — Turing has no bf16
+  fp8_tflops: null
+  int8_tops: 130
+  fp4_tflops: null
+  link_gbps: 12
+  max_tp: 4
+  price_per_hour: 0.35
+  vendor: nvidia
+
+L4:
+  arch: sm_89
+  memory_gb: 24
+  mem_bw_gbps: 300
+  bf16_tflops: 121
+  fp8_tflops: 242
+  int8_tops: 242
+  fp4_tflops: null
+  link_gbps: 25
+  max_tp: 8
+  price_per_hour: 0.70
+  vendor: nvidia
+
+A10G:
+  arch: sm_86
+  memory_gb: 24
+  mem_bw_gbps: 600
+  bf16_tflops: 70
+  fp8_tflops: null
+  int8_tops: 140
+  fp4_tflops: null
+  link_gbps: 25
+  max_tp: 8
+  price_per_hour: 1.00
+  vendor: nvidia
+
+RTX4090:
+  arch: sm_89
+  memory_gb: 24
+  mem_bw_gbps: 1008
+  bf16_tflops: 165
+  fp8_tflops: 330
+  int8_tops: 660
+  fp4_tflops: null
+  link_gbps: 25
+  max_tp: 8
+  price_per_hour: 0.45
+  vendor: nvidia
+
+L40S:
+  arch: sm_89
+  memory_gb: 48
+  mem_bw_gbps: 864
+  bf16_tflops: 362
+  fp8_tflops: 733
+  int8_tops: 733
+  fp4_tflops: null
+  link_gbps: 25
+  max_tp: 8
+  price_per_hour: 1.00
+  vendor: nvidia
+
+A100-40GB:
+  arch: sm_80
+  memory_gb: 40
+  mem_bw_gbps: 1555
+  bf16_tflops: 312
+  fp8_tflops: null
+  int8_tops: 624
+  fp4_tflops: null
+  link_gbps: 300
+  max_tp: 8
+  price_per_hour: 1.20
+  vendor: nvidia
+
+A100-80GB:
+  arch: sm_80
+  memory_gb: 80
+  mem_bw_gbps: 2039
+  bf16_tflops: 312
+  fp8_tflops: null
+  int8_tops: 624
+  fp4_tflops: null
+  link_gbps: 300
+  max_tp: 8
+  price_per_hour: 1.50
+  vendor: nvidia
+
+H100-PCIe:
+  arch: sm_90
+  memory_gb: 80
+  mem_bw_gbps: 2000
+  bf16_tflops: 756
+  fp8_tflops: 1513
+  int8_tops: 1513
+  fp4_tflops: null
+  link_gbps: 50
+  max_tp: 8
+  price_per_hour: 2.00
+  vendor: nvidia
+
+H100-SXM:
+  arch: sm_90
+  memory_gb: 80
+  mem_bw_gbps: 3350
+  bf16_tflops: 989
+  fp8_tflops: 1979
+  int8_tops: 1979
+  fp4_tflops: null
+  link_gbps: 450
+  max_tp: 8
+  price_per_hour: 2.50
+  vendor: nvidia
+
+H200:
+  arch: sm_90
+  memory_gb: 141
+  mem_bw_gbps: 4800
+  bf16_tflops: 989
+  fp8_tflops: 1979
+  int8_tops: 1979
+  fp4_tflops: null
+  link_gbps: 450
+  max_tp: 8
+  price_per_hour: 3.50
+  vendor: nvidia
+
+B200:
+  arch: sm_100
+  memory_gb: 180
+  mem_bw_gbps: 8000
+  bf16_tflops: 2250
+  fp8_tflops: 4500
+  int8_tops: 4500
+  fp4_tflops: 9000
+  link_gbps: 900
+  max_tp: 8
+  price_per_hour: 5.50
+  vendor: nvidia
+
+MI300X:
+  arch: gfx942
+  memory_gb: 192
+  mem_bw_gbps: 5300
+  bf16_tflops: 1307
+  fp8_tflops: 2615
+  int8_tops: 2615
+  fp4_tflops: null
+  link_gbps: 300
+  max_tp: 8
+  price_per_hour: 2.50
+  vendor: amd

@@ -1,0 +1,49 @@
+# brain/catalog/precisions.yaml — FACTS tier: weight formats ("model variants").
+#
+#   weight_bytes      bytes per parameter in HBM (incl. scales)
+#   compute           which tensor-core peak the matmuls run at
+#   flops_overhead    multiplier on matmul FLOPs (dequantization cost)
+#   quality_loss_pct  typical relative accuracy loss vs bf16 (approximate;
+#                     replace with your own eval for production decisions)
+#   requires          GPU capability needed (null = runs anywhere)
+#   vllm_flag         how vLLM is told to use it
+
+bf16:
+  weight_bytes: 2.0
+  compute: bf16
+  flops_overhead: 1.0
+  quality_loss_pct: 0.0
+  requires: null
+  vllm_flag: null
+
+fp8:
+  weight_bytes: 1.0
+  compute: fp8
+  flops_overhead: 1.0
+  quality_loss_pct: 0.3
+  requires: fp8
+  vllm_flag: "--quantization fp8"
+
+int8_w8a8:
+  weight_bytes: 1.0
+  compute: int8
+  flops_overhead: 1.05
+  quality_loss_pct: 0.6
+  requires: null
+  vllm_flag: "(pre-quantized W8A8 checkpoint)"
+
+awq_int4:
+  weight_bytes: 0.53
+  compute: bf16
+  flops_overhead: 1.3       # dequant in the GEMM: wins at small batch, loses at large
+  quality_loss_pct: 1.5
+  requires: null
+  vllm_flag: "--quantization awq (AWQ checkpoint)"
+
+nvfp4:
+  weight_bytes: 0.56
+  compute: fp4
+  flops_overhead: 1.05
+  quality_loss_pct: 1.0
+  requires: fp4
+  vllm_flag: "(NVFP4 checkpoint)"
